@@ -1,0 +1,117 @@
+# photo.py fuer Schuelerinnen und Schueler
+
+Dieses Skript hilft dir, aus zwei FITS-Bildern ein Sternfarben-Helligkeits-Diagramm (CMD) zu machen.
+
+Kurz gesagt:
+- Es sucht Sterne im Bild.
+- Es misst ihre Helligkeit.
+- Es vergleicht zwei Filter (meist B und V).
+- Es zeichnet ein CMD.
+
+## Was ist ein CMD?
+
+Ein CMD zeigt:
+- auf der x-Achse die Farbe: B-V
+- auf der y-Achse die Helligkeit: V
+
+Wichtig:
+- kleine V-Werte bedeuten helle Sterne
+- grosse V-Werte bedeuten schwache Sterne
+
+## Schnellstart
+
+```bash
+python photo.py /pfad/zum/fits-ordner
+```
+
+## Haeufige Befehle
+
+Nur Apertur:
+
+```bash
+python photo.py /pfad/zum/fits-ordner --photometry-method aperture
+```
+
+Nur PSF:
+
+```bash
+python photo.py /pfad/zum/fits-ordner --photometry-method psf
+```
+
+CMD speichern:
+
+```bash
+python photo.py /pfad/zum/fits-ordner --save-cm cmd.png
+```
+
+Apertur und PSF direkt vergleichen:
+
+```bash
+python photo.py /pfad/zum/fits-ordner --compare-cmd-methods --save-cmd-compare cmd_compare.png
+```
+
+## Unterschied: Apertur vs. PSF (einfach erklaert)
+
+## Apertur-Photometrie
+
+Idee:
+- Du legst einen Kreis um einen Stern.
+- Alles Licht im Kreis wird addiert.
+- Hintergrundlicht wird mit einem Ring ausserhalb abgeschaetzt und abgezogen.
+
+Gut daran:
+- einfach
+- schnell
+- funktioniert gut, wenn Sterne weit genug auseinander sind
+
+Schwachstelle:
+- wenn Sterne sehr nah beieinander liegen, kann Licht vermischt werden
+
+## PSF-Photometrie
+
+Idee:
+- Statt nur einen Kreis zu summieren, passt das Programm ein Stern-Modell an.
+- So kann es ueberlappende Sterne besser trennen.
+
+Gut daran:
+- besser in dichten Sternfeldern
+- oft genauere Trennung naher Sterne
+
+Schwachstelle:
+- braucht mehr Rechenzeit
+- haengt davon ab, wie gut das Modell passt
+
+## Was zeigt der Vergleichsplot?
+
+Wenn du --compare-cmd-methods nutzt:
+- blaue Punkte: Apertur
+- orange Punkte: PSF
+- Linien: derselbe Stern in beiden Methoden
+
+Zusaetzlich stehen im Plot/Terminal:
+- RMS Delta(B-V): typische Farbabweichung
+- RMS Delta(V): typische Helligkeitsabweichung
+- Tendenz: ist PSF eher heller/dunkler und blauer/roeter?
+
+## Kalibrierung (optional)
+
+Mit --calibrate kannst du einen Referenzstern auswaehlen.
+Dann werden aus instrumentellen Werten echte Magnituden.
+
+## Dereddening (optional)
+
+Mit E(B-V) kann die interstellare Roetung korrigiert werden.
+Dann sind Farben und Helligkeiten physikalisch besser vergleichbar.
+
+## Typische Probleme
+
+photutils fehlt:
+
+```bash
+pip install photutils
+```
+
+Keine Matches gefunden:
+- --maxsep etwas groesser machen
+- --fwhm und --threshold anpassen
+- Filterzuordnung pruefen (--filters oder --force-filters)
