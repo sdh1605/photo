@@ -26,6 +26,18 @@ python photo.py /pfad/zum/fits-ordner
 
 ## Haeufige Befehle
 
+Nur bestimmte FITS-Dateien (0-basiert):
+
+```bash
+python photo.py /pfad/zum/fits-ordner --indices 0 1
+```
+
+Bilddarstellung als PNG speichern:
+
+```bash
+python photo.py /pfad/zum/fits-ordner --save frames.png
+```
+
 Nur Apertur:
 
 ```bash
@@ -48,6 +60,12 @@ Apertur und PSF direkt vergleichen:
 
 ```bash
 python photo.py /pfad/zum/fits-ordner --compare-cmd-methods --save-cmd-compare cmd_compare.png
+```
+
+Filter aus Kommandozeile erzwingen (Header ignorieren):
+
+```bash
+python photo.py /pfad/zum/fits-ordner --filters B V --force-filters
 ```
 
 ## Unterschied: Apertur vs. PSF (einfach erklaert)
@@ -115,3 +133,6 @@ Keine Matches gefunden:
 - --maxsep etwas groesser machen
 - --fwhm und --threshold anpassen
 - Filterzuordnung pruefen (--filters oder --force-filters)
+
+Zu viele Farbausreisser im CMD:
+- --outlier-sigma groesser setzen (z.B. 4.0 oder 5.0)

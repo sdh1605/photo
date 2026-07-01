@@ -18,8 +18,8 @@ Optionen:
   --maxsep FLOAT     Max. Abstand beim Matching in Pixel (Standard: 5.0)
   --filters B V      Labels der Filter (Standard: B V)
   --save-cm FILE     Speicherpfad für das Color-Magnitude-Diagramm (relativ zum FITS-Ordner oder absolut)
-    --compare-cmd-methods  Vergleicht CMDs aus aperture- und psf-Auswertung in einem gemeinsamen Plot
-    --save-cmd-compare FILE  Speicherpfad für den CMD-Methodenvergleich (relativ zum FITS-Ordner oder absolut)
+  --compare-cmd-methods  Vergleicht CMDs aus aperture- und psf-Auswertung in einem gemeinsamen Plot
+  --save-cmd-compare FILE  Speicherpfad für den CMD-Methodenvergleich (relativ zum FITS-Ordner oder absolut)
   --cluster-radius FLOAT  Radius in Pixel um das Zentrum für Sternhaufen-Filterung (Standard: 40% der Bildhöhe, 0 = deaktiviert)
   --cluster-center X Y    Zentrum (x, y) in Pixel für Sternhaufen-Filterung (Standard: Bildmitte)
   --annulus-radii R_INNER R_OUTER  Nur Sterne in einem Ring (Annulus) zwischen innerem (R_INNER) und

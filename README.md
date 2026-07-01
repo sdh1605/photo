@@ -31,6 +31,12 @@ pip install numpy matplotlib astropy photutils
 python photo.py /pfad/zum/fits-ordner
 ```
 
+Nur bestimmte Dateien (Index 0 und 3) und Bild-Plot speichern:
+
+```bash
+python photo.py /pfad/zum/fits-ordner --indices 0 3 --save frames.png
+```
+
 Mit expliziter Methode:
 
 ```bash
@@ -54,8 +60,12 @@ python photo.py /pfad/zum/fits-ordner --compare-cmd-methods --save-cmd-compare c
 
 - `--photometry-method {aperture,psf}`
   - Waehlt die Photometrie-Methode.
+- `--indices, -i`
+  - Welche FITS-Dateien (0-basiert) genutzt werden. Ohne Angabe: die ersten zwei.
+- `--save, -s`
+  - Speichert den Bildplot der FITS-Frames als PNG.
 - `--aperture FLOAT`
-  - Aperturradius in Pixeln. Ohne Angabe wird er automatisch aus FWHM berechnet.
+  - Aperturradius in Pixeln. Ohne Angabe: automatische Wahl (empfohlen).
 - `--fwhm FLOAT`
   - FWHM fuer Quellenfindung.
 - `--threshold FLOAT`
@@ -66,6 +76,8 @@ python photo.py /pfad/zum/fits-ordner --compare-cmd-methods --save-cmd-compare c
   - Filterzuordnung, falls keine gute Header-Info vorliegt.
 - `--force-filters`
   - Erzwingt die `--filters`-Zuordnung.
+- `--outlier-sigma FLOAT`
+  - Sigma-Schwelle fuer Ausreisser in B-V (Standard: 3.0).
 - `--cluster-radius`, `--cluster-center`, `--annulus-radii`
   - Raeumliche Selektion von Sternen.
 - `--calibrate`, `--calibrate-file`
@@ -159,3 +171,6 @@ Standardmaessig werden relative Ausgabepfade im FITS-Ordner gespeichert.
   - Kalibrierung pruefen,
   - B/V-Zuordnung pruefen,
   - outlier-Schwelle mit `--outlier-sigma` anpassen.
+
+  Hinweis zu Defaults:
+  - `--age-range` Standard ist `6.8 7.6` (log(Alter/Jahre), ca. 6-40 Myr).
