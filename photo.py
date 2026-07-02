@@ -12,12 +12,15 @@ Optionen:
   -s, --save      Optionaler Pfad zum Speichern der Abbildung (PNG)
   -v, --verbose   Mehr Ausgaben
   --photometry-method METHOD  Photometrie-Methode: 'aperture' oder 'psf' (Standard: aperture)
-  --aperture FLOAT    Aperturradius in Pixel (wenn nicht angegeben: automatisch 3.0×FWHM, empfohlen!)
+  --aperture FLOAT    Aperturradius in Pixel (wenn nicht angegeben: automatisch aus dem hellsten Stern im Cluster-Radius)
+    --aperture-per-star Passe Apertur/Annulus pro Stern individuell aus dem lokalen Sternprofil an
   --fwhm FLOAT       FWHM für Quellenfindung (Standard: 3.0)
   --threshold FLOAT  Schwelle in Sigma für Quellenfindung (Standard: 5.0)
   --maxsep FLOAT     Max. Abstand beim Matching in Pixel (Standard: 5.0)
   --filters B V      Labels der Filter (Standard: B V)
   --save-cm FILE     Speicherpfad für das Color-Magnitude-Diagramm (relativ zum FITS-Ordner oder absolut)
+    --plot-stellar-profiles   Zeige Profil/PSF-Plot für einen hellen, mittleren und dunklen Stern
+    --save-stellar-profiles FILE  Speicherpfad für den Profil/PSF-Plot (relativ zum FITS-Ordner oder absolut)
   --compare-cmd-methods  Vergleicht CMDs aus aperture- und psf-Auswertung in einem gemeinsamen Plot
   --save-cmd-compare FILE  Speicherpfad für den CMD-Methodenvergleich (relativ zum FITS-Ordner oder absolut)
   --cluster-radius FLOAT  Radius in Pixel um das Zentrum für Sternhaufen-Filterung (Standard: 40% der Bildhöhe, 0 = deaktiviert)
@@ -240,7 +243,7 @@ def plot_images(images: List[Tuple[Optional[np.ndarray], Optional[dict]]], paths
                             cluster_center[1] + image_offset[1])
         
         # Zeige Aperturen falls verfügbar
-        if phot_tables and i < len(phot_tables) and phot_tables[i] is not None and aperture_radius:
+        if phot_tables and i < len(phot_tables) and phot_tables[i] is not None:
             tab = phot_tables[i]
             
             # Wenn matched_indices verfügbar ist, zeige NUR gematchte Sterne
@@ -271,8 +274,22 @@ def plot_images(images: List[Tuple[Optional[np.ndarray], Optional[dict]]], paths
                 else:
                     positions = list(zip(tab['x'], tab['y']))
             
-            apertures = CircularAperture(positions, r=aperture_radius)
-            apertures.plot(color='red', lw=1.0, alpha=0.7, ax=ax)
+            if hasattr(tab, 'colnames') and 'aperture_radius_used' in tab.colnames:
+                from matplotlib.patches import Circle
+                radii = np.asarray(tab['aperture_radius_used'], dtype=float)
+                if matched_indices is not None and len(matched_indices) > 0:
+                    radii_to_show = radii[indices_to_show]
+                elif cluster_radius is not None and current_center is not None:
+                    radii_to_show = radii[mask]
+                else:
+                    radii_to_show = radii
+
+                for (x_pos, y_pos), r in zip(positions, radii_to_show):
+                    c = Circle((x_pos, y_pos), float(r), fill=False, edgecolor='red', linewidth=1.0, alpha=0.7)
+                    ax.add_patch(c)
+            elif aperture_radius:
+                apertures = CircularAperture(positions, r=aperture_radius)
+                apertures.plot(color='red', lw=1.0, alpha=0.7, ax=ax)
         
         # Zeige Cluster-Radius-Kreis oder Annulus falls definiert (verwende aktuelles Zentrum)
         if cluster_radius is not None and current_center is not None:
@@ -299,7 +316,393 @@ def plot_images(images: List[Tuple[Optional[np.ndarray], Optional[dict]]], paths
     plt.show()
 
 
-def detect_and_photometry(data: np.ndarray, fwhm: float = 3.0, threshold_sigma: float = 5.0, aperture_radius: float = None):
+def _estimate_profile_radii_from_star(data: np.ndarray, x: float, y: float,
+                                      max_radius: float = 24.0) -> Optional[Tuple[float, float, float]]:
+    """Bestimme Apertur- und Annulus-Radien direkt aus einem Sternprofil.
+
+    Returns:
+        (r_aperture, r_annulus_inner, r_annulus_outer) oder None.
+    """
+    ny, nx = data.shape
+    rmax = max(3.0, float(max_radius))
+
+    x0 = int(round(x))
+    y0 = int(round(y))
+    xmin = max(0, x0 - int(np.ceil(rmax)))
+    xmax = min(nx, x0 + int(np.ceil(rmax)) + 1)
+    ymin = max(0, y0 - int(np.ceil(rmax)))
+    ymax = min(ny, y0 + int(np.ceil(rmax)) + 1)
+
+    cut = np.asarray(data[ymin:ymax, xmin:xmax], dtype=float)
+    if cut.size == 0:
+        return None
+
+    yy, xx = np.indices(cut.shape)
+    xx = xx + xmin
+    yy = yy + ymin
+    rr = np.sqrt((xx - x) ** 2 + (yy - y) ** 2)
+
+    bkg_mask = (rr >= 0.7 * rmax) & (rr <= rmax)
+    if np.any(bkg_mask):
+        bkg = np.median(cut[bkg_mask])
+    else:
+        bkg = np.median(cut)
+
+    signal = cut - bkg
+
+    # Rausch-Niveau aus äußerem Ring robust schätzen (MAD -> sigma).
+    if np.any(bkg_mask):
+        bkg_vals = cut[bkg_mask]
+        mad = np.median(np.abs(bkg_vals - np.median(bkg_vals)))
+        noise_sigma = 1.4826 * mad
+    else:
+        mad = np.median(np.abs(cut - np.median(cut)))
+        noise_sigma = 1.4826 * mad
+
+    if not np.isfinite(noise_sigma) or noise_sigma <= 0:
+        return None
+
+    bins = np.arange(0.0, rmax + 0.5001, 0.5)
+    centers = 0.5 * (bins[:-1] + bins[1:])
+    profile = []
+    for i in range(len(centers)):
+        mask = (rr >= bins[i]) & (rr < bins[i + 1])
+        if np.any(mask):
+            profile.append(np.median(signal[mask]))
+        else:
+            profile.append(np.nan)
+
+    profile = np.asarray(profile, dtype=float)
+    if np.sum(np.isfinite(profile)) < 2:
+        return None
+
+    # Optional glätten, um einzelne rauschbedingte Ausreißer zu unterdrücken.
+    smooth_profile = profile.copy()
+    for i in range(1, len(profile) - 1):
+        if np.isfinite(profile[i - 1]) and np.isfinite(profile[i]) and np.isfinite(profile[i + 1]):
+            smooth_profile[i] = np.median([profile[i - 1], profile[i], profile[i + 1]])
+
+    # Sternausdehnung bis in die Flügel: letzter Radius mit Signal > 0.4 sigma.
+    # Etwas strenger als zuvor, damit sehr große Aperturen bei hellen Sternen begrenzt bleiben.
+    wing_idx = np.where((np.isfinite(smooth_profile)) & (smooth_profile > 0.4 * noise_sigma))[0]
+    if len(wing_idx) > 0:
+        r_wing = centers[wing_idx[-1]] + 0.25
+    else:
+        # Falls die Flügelgrenze nicht robust ist, verwende konservativen Suchradius.
+        r_wing = max(3.0, 0.6 * rmax)
+
+    # Curve-of-growth: bestimme r_ap als Radius, der ~98.5% des eingeschlossenen Flusses erreicht.
+    # Das reduziert Flux-Verlust bei hellen Sternen mit breiten Fluegeln.
+    bin_flux = []
+    for i in range(len(centers)):
+        mask = (rr >= bins[i]) & (rr < bins[i + 1])
+        if np.any(mask):
+            # Negative Pixel nicht in die eingeschlossene Sternenergie zählen.
+            bin_flux.append(np.sum(np.clip(signal[mask], a_min=0.0, a_max=None)))
+        else:
+            bin_flux.append(0.0)
+
+    bin_flux = np.asarray(bin_flux, dtype=float)
+    if not np.any(np.isfinite(bin_flux)):
+        return None
+
+    cum_flux = np.cumsum(np.nan_to_num(bin_flux, nan=0.0))
+    wing_limit_idx = np.searchsorted(centers, r_wing, side='right') - 1
+    wing_limit_idx = int(np.clip(wing_limit_idx, 0, len(cum_flux) - 1))
+    total_flux = cum_flux[wing_limit_idx]
+    if not np.isfinite(total_flux) or total_flux <= 0:
+        return None
+
+    target_flux = 0.985 * total_flux
+    ap_candidates = np.where(cum_flux >= target_flux)[0]
+    if len(ap_candidates) == 0:
+        r_ap = r_wing
+    else:
+        r_ap = centers[ap_candidates[0]] + 0.25
+
+    if not np.isfinite(r_ap) or r_ap <= 0:
+        return None
+
+    # Annulus jenseits der Sternflügel starten, dann breit genug für robusten Hintergrund.
+    r_in = max(r_ap + 2.0, r_wing + 1.0)
+    r_out = r_in + max(6.0, 1.0 * r_ap)
+
+    return float(max(2.0, r_ap)), float(r_in), float(r_out)
+
+
+def _estimate_global_profile_radii(data: np.ndarray,
+                                   sources,
+                                   candidate_idx: np.ndarray,
+                                   fwhm: float) -> Optional[Tuple[float, float, float, int]]:
+    """Robuste globale Radius-Schätzung aus mehreren hellen Sternen.
+
+    Returns:
+        (r_ap, r_in, r_out, n_used) oder None.
+    """
+    if candidate_idx is None or len(candidate_idx) == 0:
+        return None
+
+    src_x = np.asarray(sources['xcentroid'], dtype=float)
+    src_y = np.asarray(sources['ycentroid'], dtype=float)
+
+    if 'flux' in sources.colnames:
+        brightness = np.asarray(sources['flux'], dtype=float)
+    elif 'peak' in sources.colnames:
+        brightness = np.asarray(sources['peak'], dtype=float)
+    else:
+        x_idx = np.clip(np.round(src_x).astype(int), 0, data.shape[1] - 1)
+        y_idx = np.clip(np.round(src_y).astype(int), 0, data.shape[0] - 1)
+        brightness = np.asarray(data[y_idx, x_idx], dtype=float)
+
+    cand = np.asarray(candidate_idx, dtype=int)
+    cand = cand[np.isfinite(brightness[cand]) & (brightness[cand] > 0)]
+    if len(cand) == 0:
+        return None
+
+    sort_idx = cand[np.argsort(brightness[cand])[::-1]]
+    pool = sort_idx[:min(30, len(sort_idx))]
+
+    # Vermeide extreme Top-Werte (oft Sättigung) wenn genügend Sterne vorhanden sind.
+    if len(pool) >= 10:
+        pool = pool[2:]
+
+    radii_ap = []
+    radii_in = []
+    radii_out = []
+    for idx in pool:
+        local = _estimate_profile_radii_from_star(
+            data,
+            float(src_x[idx]),
+            float(src_y[idx]),
+            max_radius=max(18.0, 10.0 * fwhm)
+        )
+        if local is None:
+            continue
+        r_ap, r_in, r_out = local
+        if r_out > r_in > r_ap > 0:
+            radii_ap.append(r_ap)
+            radii_in.append(r_in)
+            radii_out.append(r_out)
+
+    if len(radii_ap) == 0:
+        return None
+
+    r_ap_med = float(np.median(radii_ap))
+    r_in_med = float(np.median(radii_in))
+    r_out_med = float(np.median(radii_out))
+
+    # Stabilisiere gegen extreme Ausreißer und threshold-induzierte Sprünge.
+    # Obergrenze bewusst groesser, damit helle Sterne nicht zu klein beschnitten werden.
+    r_ap_med = float(np.clip(r_ap_med, 2.0 * fwhm, 10.0 * fwhm))
+    r_in_med = max(r_in_med, r_ap_med + 1.5)
+    r_out_med = max(r_out_med, r_in_med + 4.0)
+
+    return r_ap_med, r_in_med, r_out_med, len(radii_ap)
+
+
+def _radial_profile_from_star(data: np.ndarray, x: float, y: float,
+                              max_radius: float) -> Optional[Tuple[np.ndarray, np.ndarray, float]]:
+    """Berechne azimutal gemitteltes (radiales) Profil eines Sterns nach Hintergrundabzug."""
+    ny, nx = data.shape
+    rmax = max(4.0, float(max_radius))
+
+    x0 = int(round(x))
+    y0 = int(round(y))
+    half = int(np.ceil(rmax))
+    xmin = max(0, x0 - half)
+    xmax = min(nx, x0 + half + 1)
+    ymin = max(0, y0 - half)
+    ymax = min(ny, y0 + half + 1)
+
+    cut = np.asarray(data[ymin:ymax, xmin:xmax], dtype=float)
+    if cut.size == 0:
+        return None
+
+    yy, xx = np.indices(cut.shape)
+    xx = xx + xmin
+    yy = yy + ymin
+    rr = np.sqrt((xx - x) ** 2 + (yy - y) ** 2)
+
+    bkg_mask = (rr >= 0.7 * rmax) & (rr <= rmax)
+    if np.any(bkg_mask):
+        bkg = float(np.median(cut[bkg_mask]))
+    else:
+        bkg = float(np.median(cut))
+
+    signal = cut - bkg
+
+    bins = np.arange(0.0, rmax + 0.5001, 0.5)
+    centers = 0.5 * (bins[:-1] + bins[1:])
+    profile = []
+    for i in range(len(centers)):
+        mask = (rr >= bins[i]) & (rr < bins[i + 1])
+        if np.any(mask):
+            profile.append(float(np.median(signal[mask])))
+        else:
+            profile.append(np.nan)
+
+    return centers, np.asarray(profile, dtype=float), bkg
+
+
+def _fit_gaussian_psf_to_profile(r: np.ndarray, profile: np.ndarray,
+                                 fwhm_hint: float) -> Optional[Tuple[float, float, np.ndarray]]:
+    """Fitte ein einfaches 1D-Gauß-Profil an das radiale Sternprofil.
+
+    Model: I(r) = A * exp(-r^2/(2*sigma^2))
+    """
+    valid = np.isfinite(r) & np.isfinite(profile)
+    if np.sum(valid) < 5:
+        return None
+
+    r_fit = r[valid]
+    y_fit = profile[valid]
+
+    # Fokus auf den Kernbereich; negative Flügel dominieren sonst den Fit.
+    core_mask = (r_fit <= max(6.0, 2.5 * fwhm_hint)) & (y_fit > 0)
+    if np.sum(core_mask) < 4:
+        core_mask = y_fit > 0
+    if np.sum(core_mask) < 4:
+        return None
+
+    r_fit = r_fit[core_mask]
+    y_fit = y_fit[core_mask]
+
+    sigma_min = max(0.5, 0.25 * fwhm_hint)
+    sigma_max = max(6.0, 2.5 * fwhm_hint)
+    sigma_grid = np.linspace(sigma_min, sigma_max, 220)
+
+    best_sigma = None
+    best_amp = None
+    best_sse = np.inf
+
+    for sigma in sigma_grid:
+        basis = np.exp(-(r_fit ** 2) / (2.0 * sigma ** 2))
+        denom = float(np.dot(basis, basis))
+        if denom <= 0:
+            continue
+        amp = float(np.dot(y_fit, basis) / denom)
+        if amp <= 0:
+            continue
+        model = amp * basis
+        sse = float(np.sum((y_fit - model) ** 2))
+        if sse < best_sse:
+            best_sse = sse
+            best_sigma = sigma
+            best_amp = amp
+
+    if best_sigma is None or best_amp is None:
+        return None
+
+    model_full = best_amp * np.exp(-(r ** 2) / (2.0 * best_sigma ** 2))
+    fwhm_fit = 2.354820045 * best_sigma
+    return best_amp, fwhm_fit, model_full
+
+
+def plot_star_profile_psf_samples(data: np.ndarray, phot_table, fwhm: float,
+                                  save: Optional[str] = None) -> None:
+    """Zeige Profile für einen hellen, mittleren und dunklen Stern inkl. PSF-Fit."""
+    if data is None or phot_table is None or len(phot_table) < 3:
+        print("Zu wenige Sterne für Profil/PSF-Plot.")
+        return
+
+    if 'aperture_sum_bkgsub' in phot_table.colnames:
+        flux = np.asarray(phot_table['aperture_sum_bkgsub'], dtype=float)
+    elif 'flux' in phot_table.colnames:
+        flux = np.asarray(phot_table['flux'], dtype=float)
+    elif 'peak' in phot_table.colnames:
+        flux = np.asarray(phot_table['peak'], dtype=float)
+    else:
+        x_idx = np.clip(np.round(np.asarray(phot_table['x'], dtype=float)).astype(int), 0, data.shape[1] - 1)
+        y_idx = np.clip(np.round(np.asarray(phot_table['y'], dtype=float)).astype(int), 0, data.shape[0] - 1)
+        flux = np.asarray(data[y_idx, x_idx], dtype=float)
+
+    finite = np.where(np.isfinite(flux))[0]
+    if len(finite) < 3:
+        print("Zu wenige gültige Flüsse für Profil/PSF-Plot.")
+        return
+
+    flux_valid = flux[finite]
+    sort_local = np.argsort(flux_valid)
+    idx_dark = finite[sort_local[max(0, int(0.2 * (len(sort_local) - 1)))]]
+    idx_mid = finite[sort_local[max(0, int(0.5 * (len(sort_local) - 1)))]]
+    idx_bright = finite[sort_local[-1]]
+
+    sample_indices = [idx_bright, idx_mid, idx_dark]
+    sample_names = ['Heller Stern', 'Mittel heller Stern', 'Dunkler Stern']
+
+    fig, axes = plt.subplots(1, 3, figsize=(16, 4.8), sharey=False)
+    rmax = max(10.0, 8.0 * fwhm)
+    plotted_any = False
+
+    for ax, idx, name in zip(axes, sample_indices, sample_names):
+        x = float(phot_table['x'][idx])
+        y = float(phot_table['y'][idx])
+        prof = _radial_profile_from_star(data, x, y, max_radius=rmax)
+        if prof is None:
+            ax.set_title(f"{name}\nkein Profil")
+            ax.grid(alpha=0.3)
+            continue
+
+        r, y_prof, bkg = prof
+        fit = _fit_gaussian_psf_to_profile(r, y_prof, fwhm_hint=fwhm)
+
+        ax.plot(r, y_prof, 'o', ms=3.8, alpha=0.8, label='Azimutal gemitteltes Profil')
+        if fit is not None:
+            amp, fwhm_fit, model = fit
+            ax.plot(r, model, '-', lw=2.0, label=f'Gauß-PSF-Fit (FWHM={fwhm_fit:.2f}px)')
+            ax.text(0.03, 0.97, f"A={amp:.1f}\nBkg={bkg:.1f}", transform=ax.transAxes,
+                    va='top', ha='left', fontsize=8,
+                    bbox=dict(boxstyle='round', facecolor='white', alpha=0.85, edgecolor='0.7'))
+        else:
+            ax.text(0.03, 0.97, f"Kein stabiler PSF-Fit\nBkg={bkg:.1f}", transform=ax.transAxes,
+                    va='top', ha='left', fontsize=8,
+                    bbox=dict(boxstyle='round', facecolor='white', alpha=0.85, edgecolor='0.7'))
+
+        ax.set_title(f"{name}\n(x={x:.1f}, y={y:.1f})")
+        ax.set_xlabel('Radius [Pixel]')
+
+        # Eigene y-Skalierung pro Panel, damit mittlere/schwache Sterne sichtbar bleiben.
+        y_vals = y_prof[np.isfinite(y_prof)]
+        if fit is not None:
+            y_model = model[np.isfinite(model)]
+            y_vals = np.concatenate([y_vals, y_model]) if y_model.size > 0 else y_vals
+        if y_vals.size > 0:
+            y_lo = float(np.nanpercentile(y_vals, 2))
+            y_hi = float(np.nanpercentile(y_vals, 99))
+            if not np.isfinite(y_lo) or not np.isfinite(y_hi) or y_hi <= y_lo:
+                y_lo = float(np.nanmin(y_vals))
+                y_hi = float(np.nanmax(y_vals))
+            if np.isfinite(y_lo) and np.isfinite(y_hi) and y_hi > y_lo:
+                pad = 0.10 * (y_hi - y_lo)
+                if y_hi > 0 and y_lo >= 0:
+                    y_lo = -0.05 * y_hi
+                ax.set_ylim(y_lo - pad, y_hi + pad)
+
+        ax.grid(alpha=0.3)
+        ax.legend(fontsize=8, loc='upper right')
+        plotted_any = True
+
+    axes[0].set_ylabel('Signal über Hintergrund [ADU]')
+    fig.suptitle('Azimutal gemittelte 2D-Sternprofile mit angepasster PSF', fontsize=13)
+    plt.tight_layout()
+    if save:
+        try:
+            fig.savefig(save, dpi=150)
+            print(f"Sternprofil/PSF-Plot gespeichert: {save}")
+        except Exception as e:
+            print(f"Fehler beim Speichern des Sternprofil/PSF-Plots: {e}", file=sys.stderr)
+    if plotted_any:
+        plt.show()
+    else:
+        plt.close(fig)
+
+
+def detect_and_photometry(data: np.ndarray, fwhm: float = 3.0, threshold_sigma: float = 5.0,
+                          aperture_radius: float = None,
+                          cluster_center: Optional[Tuple[float, float]] = None,
+                          cluster_radius: Optional[float] = None,
+                          aperture_per_star: bool = False,
+                          detect_fwhm_scale: float = 0.85):
     """Erkenne Quellen mit DAOStarFinder und führe Aperturphotometrie mit Hintergrundsubtraktion aus.
 
     Liefert (phot_table, aperture_radius):
@@ -310,8 +713,10 @@ def detect_and_photometry(data: np.ndarray, fwhm: float = 3.0, threshold_sigma: 
     Die Hintergrundsubtraktion erfolgt mittels Sky-Annulus (Kreisring um jede Quelle).
     
     Parameters:
-        aperture_radius: Wenn None, wird automatisch 3.0×FWHM verwendet (empfohlen!).
-                        Manueller Wert nur wenn spezielle Anforderungen vorliegen.
+        aperture_radius: Wenn None, wird automatisch robust aus mehreren hellen Sternen geschätzt.
+        cluster_center: Zentrum der Cluster-Selektion (x, y) für die Radius-Schätzung.
+        cluster_radius: Radius der Cluster-Selektion für die Radius-Schätzung.
+        aperture_per_star: Falls True, werden Apertur/Annulus pro Stern individuell gesetzt.
     
     Returns:
         (phot_table, aperture_radius): Tuple aus Photometrie-Tabelle und verwendetem Aperturradius
@@ -324,36 +729,168 @@ def detect_and_photometry(data: np.ndarray, fwhm: float = 3.0, threshold_sigma: 
         )
         raise RuntimeError(msg)
     
-    # Automatische Apertur-Berechnung basierend auf FWHM
-    # Verwende 3.0×FWHM um auch helle (gesättigte) Sterne vollständig zu erfassen
-    # Helle Sterne haben oft größere PSF durch Sättigung, Blooming, etc.
-    # Für einheitliche Photometrie: eine Apertur für alle Sterne (basierend auf hellsten Sternen)
-    if aperture_radius is None:
-        aperture_radius = 3.0 * fwhm  # Konservativ: erfasst ~95% des Lichts
-        print(f"  Automatische Apertur: radius = 3.0 × FWHM = 3.0 × {fwhm:.1f} = {aperture_radius:.1f} Pixel")
-        print(f"    (3.0×FWHM ist konservativ und erfasst auch helle/gesättigte Sterne vollständig)")
-    else:
-        print(f"  Manuelle Apertur: radius = {aperture_radius:.1f} Pixel")
-    
     # Robust stats für Quellenfindung
     mean, median, std = sigma_clipped_stats(data, sigma=3.0)
     threshold = median + threshold_sigma * std
 
-    daofind = DAOStarFinder(fwhm=fwhm, threshold=threshold)
+    finder_fwhm = max(1.2, float(fwhm) * float(detect_fwhm_scale))
+    daofind = DAOStarFinder(fwhm=finder_fwhm, threshold=threshold)
     sources = daofind(data - median)
     if sources is None or len(sources) == 0:
         return None
 
+    auto_aperture_requested = aperture_radius is None
+
+    if aperture_radius is None:
+        src_x = np.asarray(sources['xcentroid'], dtype=float)
+        src_y = np.asarray(sources['ycentroid'], dtype=float)
+
+        if cluster_center is not None and cluster_radius is not None and cluster_radius > 0:
+            dist = np.sqrt((src_x - cluster_center[0]) ** 2 + (src_y - cluster_center[1]) ** 2)
+            candidate_mask = dist <= cluster_radius
+        else:
+            candidate_mask = np.ones(len(sources), dtype=bool)
+
+        candidate_idx = np.where(candidate_mask)[0]
+        if len(candidate_idx) == 0:
+            candidate_idx = np.arange(len(sources))
+
+        profile_radii = _estimate_global_profile_radii(data, sources, candidate_idx, fwhm)
+        profile_annulus_inner = None
+        profile_annulus_outer = None
+        if profile_radii is not None:
+            aperture_radius, profile_annulus_inner, profile_annulus_outer, n_used = profile_radii
+
+        if profile_radii is not None and np.isfinite(aperture_radius) and aperture_radius > 0:
+            print(f"  Automatische Apertur: robuste Profil-Schätzung aus {n_used} hellen Sternen")
+            print(f"    Apertur-Radius = {aperture_radius:.2f} Pixel")
+            print(f"    Annulus direkt aus Sternprofil: r_in={profile_annulus_inner:.2f}, r_out={profile_annulus_outer:.2f} Pixel")
+        else:
+            aperture_radius = 3.0 * fwhm
+            profile_annulus_inner = None
+            profile_annulus_outer = None
+            print("  Warnung: Sternprofil konnte nicht robust ausgewertet werden. Fallback auf 3.0×FWHM.")
+            print(f"    Apertur-Radius = {aperture_radius:.2f} Pixel")
+    else:
+        profile_annulus_inner = None
+        profile_annulus_outer = None
+        print(f"  Manuelle Apertur: radius = {aperture_radius:.1f} Pixel")
+
     # Verwende Zentren der Quellen für Aperturphotometrie
     positions = list(zip(sources['xcentroid'], sources['ycentroid']))
+
+    # Optional: adaptive Aperturen pro Stern basierend auf jeweiligem Sternprofil.
+    # WICHTIG: Auch mit gesetztem --aperture aktiv. Dann dient --aperture als Basisradius.
+    if aperture_per_star:
+        n_sources = len(positions)
+        per_aperture = np.full(n_sources, aperture_radius, dtype=float)
+        if profile_annulus_inner is not None and profile_annulus_outer is not None:
+            per_r_in = np.full(n_sources, profile_annulus_inner, dtype=float)
+            per_r_out = np.full(n_sources, profile_annulus_outer, dtype=float)
+        else:
+            per_r_in = np.full(n_sources, aperture_radius * 1.5, dtype=float)
+            per_r_out = np.full(n_sources, aperture_radius * 2.5, dtype=float)
+
+        # Helligkeits-Skalierung als robustes Fallback, falls lokales Profil nicht stabil ist.
+        if 'flux' in sources.colnames:
+            brightness = np.asarray(sources['flux'], dtype=float)
+        elif 'peak' in sources.colnames:
+            brightness = np.asarray(sources['peak'], dtype=float)
+        else:
+            x_idx = np.clip(np.round(np.asarray(sources['xcentroid'], dtype=float)).astype(int), 0, data.shape[1] - 1)
+            y_idx = np.clip(np.round(np.asarray(sources['ycentroid'], dtype=float)).astype(int), 0, data.shape[0] - 1)
+            brightness = np.asarray(data[y_idx, x_idx], dtype=float)
+
+        finite_brightness = brightness[np.isfinite(brightness) & (brightness > 0)]
+        if finite_brightness.size > 0:
+            brightness_ref = float(np.percentile(finite_brightness, 90))
+        else:
+            brightness_ref = 1.0
+
+        adaptive_ok = 0
+        fallback_scaled = 0
+        for idx, (x, y) in enumerate(positions):
+            local_radii = _estimate_profile_radii_from_star(data, float(x), float(y), max_radius=max(18.0, 10.0 * fwhm))
+            if local_radii is None:
+                # Fallback: Radius ueber Helligkeit skalieren (helle Sterne groesser).
+                b = brightness[idx] if np.isfinite(brightness[idx]) else brightness_ref
+                ratio = max(1e-6, float(b) / max(1e-6, brightness_ref))
+                scale = np.clip(ratio ** 0.28, 0.65, 2.00)
+                per_aperture[idx] = max(2.0, aperture_radius * scale)
+                per_r_in[idx] = per_aperture[idx] + 2.0
+                per_r_out[idx] = per_r_in[idx] + max(6.0, per_aperture[idx])
+                fallback_scaled += 1
+                continue
+            r_ap_local, r_in_local, r_out_local = local_radii
+            if np.isfinite(r_ap_local) and np.isfinite(r_in_local) and np.isfinite(r_out_local) and r_out_local > r_in_local > r_ap_local > 0:
+                # Leichte Helligkeits-Gewichtung, damit helle Sterne sichtbar groessere Aperturen haben.
+                b = brightness[idx] if np.isfinite(brightness[idx]) else brightness_ref
+                ratio = max(1e-6, float(b) / max(1e-6, brightness_ref))
+                scale = np.clip(ratio ** 0.17, 0.78, 1.70)
+                per_aperture[idx] = max(2.0, r_ap_local * scale)
+                per_r_in[idx] = max(per_aperture[idx] + 1.5, r_in_local * scale)
+                per_r_out[idx] = max(per_r_in[idx] + 4.0, r_out_local * scale)
+                adaptive_ok += 1
+
+        print(
+            f"  Adaptive Apertur pro Stern: {adaptive_ok}/{n_sources} aus Profil, "
+            f"{fallback_scaled}/{n_sources} ueber Helligkeits-Fallback skaliert"
+        )
+        print(
+            f"    Verwendete Apertur-Radien: min={np.min(per_aperture):.2f}, "
+            f"median={np.median(per_aperture):.2f}, max={np.max(per_aperture):.2f} Pixel"
+        )
+
+        aperture_sum = np.zeros(n_sources, dtype=float)
+        bkg_median = np.zeros(n_sources, dtype=float)
+
+        for idx, (x, y) in enumerate(positions):
+            r_ap = float(per_aperture[idx])
+            r_in = float(per_r_in[idx])
+            r_out = float(per_r_out[idx])
+
+            ap = CircularAperture([(x, y)], r=r_ap)
+            ap_tab = aperture_photometry(data, ap)
+            aperture_sum[idx] = float(ap_tab['aperture_sum'][0])
+
+            ann = CircularAnnulus([(x, y)], r_in=r_in, r_out=r_out)
+            ann_mask = ann.to_mask(method='center')[0]
+            ann_data = ann_mask.multiply(data)
+            ann_data_1d = ann_data[ann_mask.data > 0]
+            if ann_data_1d.size > 0:
+                _, median_val, _ = sigma_clipped_stats(ann_data_1d, sigma=3.0)
+                bkg_median[idx] = median_val
+            else:
+                bkg_median[idx] = median
+
+        aperture_area = np.pi * per_aperture**2
+        total_bkg = bkg_median * aperture_area
+        aperture_sum_bkgsub = aperture_sum - total_bkg
+
+        phot_table = sources.copy()
+        phot_table['aperture_sum'] = aperture_sum
+        phot_table['x'] = sources['xcentroid']
+        phot_table['y'] = sources['ycentroid']
+        phot_table['sky_median'] = bkg_median
+        phot_table['aperture_sum_bkgsub'] = aperture_sum_bkgsub
+        phot_table['aperture_radius_used'] = per_aperture
+        phot_table['annulus_r_in_used'] = per_r_in
+        phot_table['annulus_r_out_used'] = per_r_out
+
+        aperture_repr = float(np.median(per_aperture))
+        return phot_table, aperture_repr
     
     # Signal-Apertur
     apertures = CircularAperture(positions, r=aperture_radius)
     phot_table = aperture_photometry(data, apertures)
     
-    # Hintergrund-Annulus (typischerweise zwischen r_in = 1.5*r und r_out = 2.5*r)
-    r_in = aperture_radius * 1.5
-    r_out = aperture_radius * 2.5
+    # Hintergrund-Annulus: bevorzugt direkt aus Profil des hellsten Sterns, sonst Fallback.
+    if profile_annulus_inner is not None and profile_annulus_outer is not None:
+        r_in = profile_annulus_inner
+        r_out = profile_annulus_outer
+    else:
+        r_in = aperture_radius * 1.5
+        r_out = aperture_radius * 2.5
     annulus_apertures = CircularAnnulus(positions, r_in=r_in, r_out=r_out)
     annulus_masks = annulus_apertures.to_mask(method='center')
     
@@ -385,7 +922,8 @@ def detect_and_photometry(data: np.ndarray, fwhm: float = 3.0, threshold_sigma: 
     return phot_table, aperture_radius  # Gebe auch den verwendeten Radius zurück!
 
 
-def detect_and_psf_photometry(data: np.ndarray, fwhm: float = 3.0, threshold_sigma: float = 5.0, aperture_radius: float = None):
+def detect_and_psf_photometry(data: np.ndarray, fwhm: float = 3.0, threshold_sigma: float = 5.0,
+                              aperture_radius: float = None, detect_fwhm_scale: float = 0.85):
     """Erkenne Quellen mit DAOStarFinder und führe PSF-Photometrie durch.
     
     PSF-Photometrie ist besser geeignet für dichte Sternfelder, da sie einzelne Sterne
@@ -425,7 +963,8 @@ def detect_and_psf_photometry(data: np.ndarray, fwhm: float = 3.0, threshold_sig
     mean, median, std = sigma_clipped_stats(data, sigma=3.0)
     threshold = median + threshold_sigma * std
     
-    daofind = DAOStarFinder(fwhm=fwhm, threshold=threshold)
+    finder_fwhm = max(1.2, float(fwhm) * float(detect_fwhm_scale))
+    daofind = DAOStarFinder(fwhm=finder_fwhm, threshold=threshold)
     sources = daofind(data - median)
     if sources is None or len(sources) == 0:
         return None
@@ -526,7 +1065,11 @@ def detect_and_psf_photometry(data: np.ndarray, fwhm: float = 3.0, threshold_sig
 
 
 def detect_and_photometry_wrapper(data: np.ndarray, method: str = 'aperture', fwhm: float = 3.0, 
-                                   threshold_sigma: float = 5.0, aperture_radius: float = None):
+                                   threshold_sigma: float = 5.0, aperture_radius: float = None,
+                                   cluster_center: Optional[Tuple[float, float]] = None,
+                                   cluster_radius: Optional[float] = None,
+                                   aperture_per_star: bool = False,
+                                   detect_fwhm_scale: float = 0.85):
     """Wrapper-Funktion, die zwischen Apertur- und PSF-Photometrie wählt.
     
     Parameters:
@@ -535,16 +1078,24 @@ def detect_and_photometry_wrapper(data: np.ndarray, method: str = 'aperture', fw
         fwhm: FWHM in Pixel für Quellenfindung
         threshold_sigma: Schwelle in Sigma
         aperture_radius: Aperturradius (auto-berechnet falls None)
+        cluster_center: Zentrum fuer Cluster-Selektion fuer Auto-Apertur
+        cluster_radius: Radius fuer Cluster-Selektion fuer Auto-Apertur
+        aperture_per_star: Falls True, pro Stern individuelle Apertur/Annulus-Radien
     
     Returns:
         (phot_table, aperture_radius): Photometrie-Ergebnisse
     """
     if method == 'psf':
         return detect_and_psf_photometry(data, fwhm=fwhm, threshold_sigma=threshold_sigma, 
-                                         aperture_radius=aperture_radius)
+                                         aperture_radius=aperture_radius,
+                                         detect_fwhm_scale=detect_fwhm_scale)
     else:  # default: 'aperture'
         return detect_and_photometry(data, fwhm=fwhm, threshold_sigma=threshold_sigma, 
-                                     aperture_radius=aperture_radius)
+                                     aperture_radius=aperture_radius,
+                                     cluster_center=cluster_center,
+                                     cluster_radius=cluster_radius,
+                                     aperture_per_star=aperture_per_star,
+                                     detect_fwhm_scale=detect_fwhm_scale)
 
 
 def estimate_transform(coords1, coords2, matches):
@@ -891,24 +1442,48 @@ def load_calibration(filename, phot_tables, matched_indices):
                     mag_V = float(parts[4])
                     
                     print(f"Kalibrierungsdaten geladen aus: {filename}")
-                    print(f"  Referenzstern: Index {ref_index}, Position ({ref_x:.1f}, {ref_y:.1f})")
+                    print(f"  Referenzstern (gespeichert): Index {ref_index}, Position ({ref_x:.1f}, {ref_y:.1f})")
                     print(f"  Magnituden: B={mag_B:.3f}, V={mag_V:.3f}")
-                    
-                    # Prüfe ob der Index in den gematchten Sternen existiert
+
+                    # WICHTIG: Der gespeicherte Index ist zwischen Läufen nicht stabil,
+                    # besonders bei anderem threshold. Daher primär über (x, y) remappen.
+                    mapped_ref_index = ref_index
+
                     if phot_tables and phot_tables[0] is not None:
-                        if ref_index >= len(phot_tables[0]):
-                            print(f"WARNUNG: Referenzstern-Index {ref_index} existiert nicht in aktuellen Daten!")
-                            return None, None, None, None, None
-                    
-                    # Prüfe ob der Stern in matched_indices ist
+                        tabB = phot_tables[0]
+                        coords = np.vstack((np.array(tabB['x']), np.array(tabB['y']))).T
+                        ref_pos = np.array([ref_x, ref_y])
+                        dists = np.linalg.norm(coords - ref_pos, axis=1)
+                        nearest_idx = int(np.argmin(dists))
+                        nearest_dist = float(dists[nearest_idx])
+
+                        # Nutze die Koordinaten-basierte Zuordnung, sofern plausibel.
+                        # 8 Pixel ist konservativ genug für kleine Transformationsreste.
+                        if nearest_dist <= 8.0:
+                            mapped_ref_index = nearest_idx
+                            print(f"  Referenzstern remapped über Koordinaten: Index {mapped_ref_index} (Δ={nearest_dist:.2f} px)")
+                        else:
+                            print(f"WARNUNG: Nächster Stern liegt {nearest_dist:.2f} px entfernt. Verwende gespeicherten Index {ref_index}.")
+
+                    # Stelle sicher, dass der Referenzstern in den Matches ist.
+                    # Falls nicht, nimm den räumlich nächsten gematchten B-Stern.
                     if matched_indices:
-                        found = any(idx1 == ref_index for idx1, idx2 in matched_indices)
-                        if not found:
-                            print(f"WARNUNG: Referenzstern ist nicht in den gematchten Sternen!")
-                            print(f"  Möglicherweise hat sich die Sternauswahl geändert (anderer Radius?).")
+                        found = any(idx1 == mapped_ref_index for idx1, idx2 in matched_indices)
+                        if not found and phot_tables and phot_tables[0] is not None:
+                            tabB = phot_tables[0]
+                            coords = np.vstack((np.array(tabB['x']), np.array(tabB['y']))).T
+                            ref_pos = np.array([ref_x, ref_y])
+                            matched_b = np.array([idx1 for idx1, _ in matched_indices], dtype=int)
+                            matched_coords = coords[matched_b]
+                            dists_m = np.linalg.norm(matched_coords - ref_pos, axis=1)
+                            j = int(np.argmin(dists_m))
+                            mapped_ref_index = int(matched_b[j])
+                            print(f"  Referenzstern auf nächsten gematchten B-Stern gelegt: Index {mapped_ref_index} (Δ={dists_m[j]:.2f} px)")
+                        elif not found:
+                            print("WARNUNG: Referenzstern ist nicht in den gematchten Sternen und konnte nicht remapped werden.")
                             return None, None, None, None, None
-                    
-                    return ref_index, mag_B, mag_V, ref_x, ref_y
+
+                    return mapped_ref_index, mag_B, mag_V, ref_x, ref_y
         
         print(f"FEHLER: Keine gültigen Kalibrierungsdaten in {filename} gefunden.")
         return None, None, None, None, None
@@ -1061,10 +1636,9 @@ def load_parsec_table(filepath, age_log, main_sequence_only=False):
         b_v_list = []
         v_abs_list = []
         ages_found = set()
+        parsed_rows = []
         n_total = 0
         n_filtered = 0
-        
-        tolerance = 0.05  # Toleranz für log(age) Vergleich
         
         for line in lines[data_start:]:
             # Überspringe Kommentare und leere Zeilen
@@ -1078,32 +1652,54 @@ def load_parsec_table(filepath, age_log, main_sequence_only=False):
             try:
                 logage = float(parts[col_logage])
                 ages_found.add(logage)
-                
-                # Prüfe ob dieses Alter passt
-                if abs(logage - age_log) < tolerance:
-                    n_total += 1
-                    
-                    # Filtere nach evolutionärem Stadium wenn gewünscht
-                    if main_sequence_only and col_label is not None:
-                        try:
-                            label = int(parts[col_label])
-                            # PARSEC labels: 0 = pre-MS, 1 = MS, 2 = SGB, 3 = RGB, etc.
-                            # Wir wollen nur 0 und 1 (pre-MS und MS)
-                            if label > 1:
-                                n_filtered += 1
-                                continue
-                        except (ValueError, IndexError):
-                            pass
-                    
-                    b_mag = float(parts[col_bmag])
-                    v_mag = float(parts[col_vmag])
-                    
-                    # Filtere unphysikalische Werte
-                    if -15 < v_mag < 20 and -1 < (b_mag - v_mag) < 3:
-                        b_v_list.append(b_mag - v_mag)
-                        v_abs_list.append(v_mag)
+
+                # Parse Zeile und speichere für zweite Pass-Runde (nächstes Tabellenalter).
+                b_mag = float(parts[col_bmag])
+                v_mag = float(parts[col_vmag])
+                label_val = None
+                if col_label is not None and len(parts) > col_label:
+                    try:
+                        label_val = int(parts[col_label])
+                    except (ValueError, IndexError):
+                        label_val = None
+                parsed_rows.append((logage, b_mag, v_mag, label_val))
             except (ValueError, IndexError):
                 continue
+
+        if len(ages_found) == 0:
+            print(f"  WARNUNG: Keine gültigen Alterswerte in {filepath} gefunden!")
+            return None, None
+
+        # Wähle das nächste verfügbare Tabellenalter.
+        # Bei Gleichstand wird das kleinere Alter bevorzugt.
+        ages_available = np.array(sorted(ages_found), dtype=float)
+        diffs = np.abs(ages_available - age_log)
+        min_diff = np.min(diffs)
+        nearest_candidates = ages_available[np.isclose(diffs, min_diff, atol=1e-10)]
+        selected_age = float(np.min(nearest_candidates))
+
+        if not np.isclose(selected_age, age_log, atol=1e-4):
+            print(f"  Hinweis: log(age)={age_log:.3f} nicht direkt in Tabelle, verwende nächstes Alter {selected_age:.2f}")
+
+        select_tol = 1e-4
+        for logage, b_mag, v_mag, label_val in parsed_rows:
+            if abs(logage - selected_age) > select_tol:
+                continue
+
+            n_total += 1
+
+            # Filtere nach evolutionärem Stadium wenn gewünscht
+            if main_sequence_only and label_val is not None:
+                # PARSEC labels: 0 = pre-MS, 1 = MS, 2 = SGB, 3 = RGB, etc.
+                # Wir wollen nur 0 und 1 (pre-MS und MS)
+                if label_val > 1:
+                    n_filtered += 1
+                    continue
+
+            # Filtere unphysikalische Werte
+            if -15 < v_mag < 20 and -1 < (b_mag - v_mag) < 3:
+                b_v_list.append(b_mag - v_mag)
+                v_abs_list.append(v_mag)
         
         if len(b_v_list) == 0:
             print(f"  WARNUNG: Keine Daten für log(age)={age_log:.3f} gefunden!")
@@ -1118,7 +1714,7 @@ def load_parsec_table(filepath, age_log, main_sequence_only=False):
         if main_sequence_only and n_filtered > 0:
             print(f"  Erfolgreich! {len(b_v)} Hauptreihen-Sterne (gefiltert: {n_filtered} Post-MS)")
         else:
-            print(f"  Erfolgreich! {len(b_v)} Datenpunkte für log(age)={age_log:.3f}")
+            print(f"  Erfolgreich! {len(b_v)} Datenpunkte für log(age)={selected_age:.2f} (angefragt: {age_log:.3f})")
         print(f"  B-V: [{np.min(b_v):.2f}, {np.max(b_v):.2f}], M_V: [{np.min(v_abs):.2f}, {np.max(v_abs):.2f}]")
         
         return b_v, v_abs
@@ -2182,14 +2778,22 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument('--indices', '-i', type=int, nargs='*', help='Index(e) der anzuzeigenden Dateien (0-basiert). Wenn nicht gesetzt, werden die ersten zwei verwendet.')
     parser.add_argument('--save', '-s', help='Optional: Pfad (z.B. out.png) um die erzeugte Abbildung der Frames zu speichern')
     parser.add_argument('--save-cm', help='Optional: Pfad (z.B. cm.png) um das Color-Magnitude-Diagramm zu speichern')
+    parser.add_argument('--plot-stellar-profiles', action='store_true',
+                        help='Zeige einen Plot mit radial gemittelten Sternprofilen (hell/mittel/dunkel) und PSF-Fit.')
+    parser.add_argument('--save-stellar-profiles', type=str, default=None,
+                        help='Optional: Pfad (z.B. stellar_profiles.png) zum Speichern des Profil/PSF-Plots.')
     parser.add_argument('--compare-cmd-methods', action='store_true',
                         help='Vergleiche CMDs von aperture und psf in einem gemeinsamen Plot mit unterschiedlichen Farben.')
     parser.add_argument('--save-cmd-compare', type=str, default=None,
                         help='Optional: Pfad (z.B. cmd_compare.png) zum Speichern des CMD-Methodenvergleichs.')
     parser.add_argument('--verbose', '-v', action='store_true', help='Mehr Ausgaben')
     parser.add_argument('--aperture', type=float, default=None, 
-                       help='Aperturradius in Pixel. Wenn nicht angegeben: automatisch 2.5×FWHM (empfohlen!)')
+                       help='Aperturradius in Pixel. Wenn nicht angegeben: automatisch aus dem hellsten Stern im Cluster-Radius.')
+    parser.add_argument('--aperture-per-star', action='store_true',
+                       help='Passe Apertur/Annulus pro Stern individuell aus dem lokalen Sternprofil an (nur aperture-Methode).')
     parser.add_argument('--fwhm', type=float, default=3.0, help='FWHM in Pixel für Quellenfindung (Standard 3.0)')
+    parser.add_argument('--detect-fwhm-scale', type=float, default=0.85,
+                        help='Skalierung des FWHM nur für die Peak-Erkennung. Kleiner trennt nahe Sterne besser (Standard 0.85).')
     parser.add_argument('--threshold', type=float, default=5.0, help='Schwelle in sigma für Quellenfindung (Standard 5.0)')
     parser.add_argument('--photometry-method', type=str, choices=['aperture', 'psf'], default='aperture',
                         help='Photometrie-Methode: aperture (Standard) oder psf (besser für dichte Sternfelder)')
@@ -2221,6 +2825,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help='Sigma-Schwelle für Ausreißer-Filterung in B-V Farbe (Standard: 3.0). Höhere Werte = weniger Filterung.')
     args = parser.parse_args(argv)
 
+    if args.detect_fwhm_scale <= 0:
+        print("--detect-fwhm-scale muss > 0 sein.", file=sys.stderr)
+        return 2
+
     folder = args.folder
     if not os.path.isdir(folder):
         print(f"Ordner existiert nicht: {folder}", file=sys.stderr)
@@ -2242,6 +2850,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         else:
             save_cmd_path = get_output_path(folder, args.save_cm)
 
+    save_stellar_profiles_path = None
+    if args.save_stellar_profiles:
+        if os.path.isabs(args.save_stellar_profiles):
+            save_stellar_profiles_path = args.save_stellar_profiles
+        else:
+            save_stellar_profiles_path = get_output_path(folder, args.save_stellar_profiles)
+
     save_cmd_compare_path = None
     if args.save_cmd_compare:
         if os.path.isabs(args.save_cmd_compare):
@@ -2260,10 +2875,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         calibrate_file_path = get_output_path(folder, 'calib.txt')
     
     if args.verbose:
+        print(f"Erkennungs-FWHM: {args.detect_fwhm_scale:.2f} × {args.fwhm:.2f} = {args.detect_fwhm_scale * args.fwhm:.2f} Pixel")
         if save_images_path:
             print(f"Bilder werden gespeichert in: {save_images_path}")
         if save_cmd_path:
             print(f"CMD wird gespeichert in: {save_cmd_path}")
+        if save_stellar_profiles_path:
+            print(f"Sternprofil/PSF-Plot wird gespeichert in: {save_stellar_profiles_path}")
         if save_cmd_compare_path:
             print(f"CMD-Methodenvergleich wird gespeichert in: {save_cmd_compare_path}")
         if calibrate_file_path:
@@ -2367,13 +2985,25 @@ def main(argv: Optional[List[str]] = None) -> int:
         method = args.photometry_method if hasattr(args, 'photometry_method') else 'aperture'
         if args.verbose:
             print(f"Verwende {method}-Photometrie...")
+        if args.aperture_per_star and method != 'aperture':
+            print("Hinweis: --aperture-per-star wirkt nur mit --photometry-method aperture und wird hier ignoriert.")
+        if args.aperture_per_star and args.aperture is not None:
+            print("Hinweis: --aperture ist gesetzt; --aperture-per-star nutzt diesen Wert als Basis und skaliert pro Stern.")
         
         result1 = detect_and_photometry_wrapper(datas[0], method=method, fwhm=args.fwhm, 
                                                threshold_sigma=args.threshold, 
-                                               aperture_radius=args.aperture) if datas[0] is not None else (None, None)
+                                               aperture_radius=args.aperture,
+                                               cluster_center=cluster_center,
+                                               cluster_radius=cluster_radius,
+                                               aperture_per_star=args.aperture_per_star,
+                                               detect_fwhm_scale=args.detect_fwhm_scale) if datas[0] is not None else (None, None)
         result2 = detect_and_photometry_wrapper(datas[1], method=method, fwhm=args.fwhm, 
                                                threshold_sigma=args.threshold, 
-                                               aperture_radius=args.aperture) if datas[1] is not None else (None, None)
+                                               aperture_radius=args.aperture,
+                                               cluster_center=cluster_center,
+                                               cluster_radius=cluster_radius,
+                                               aperture_per_star=args.aperture_per_star,
+                                               detect_fwhm_scale=args.detect_fwhm_scale) if datas[1] is not None else (None, None)
         
         # Entpacke Ergebnisse
         tab1, aperture_used_1 = result1
@@ -2393,6 +3023,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     if tab1 is None or tab2 is None:
         print("In mindestens einem Bild wurden keine Quellen gefunden.")
         return 1
+
+    if args.plot_stellar_profiles or args.save_stellar_profiles:
+        # Nutze das erste Bild (typisch B-Frame) für repräsentative Sternprofile.
+        plot_star_profile_psf_samples(datas[0], tab1, fwhm=args.fwhm, save=save_stellar_profiles_path)
 
     # Führe Matching durch um den Offset zu bekommen
     matched, image_offset = match_sources(tab1, tab2, max_sep=args.maxsep, 
@@ -2515,11 +3149,17 @@ def main(argv: Optional[List[str]] = None) -> int:
                 try:
                     compare_result1 = detect_and_photometry_wrapper(
                         datas[0], method=compare_method, fwhm=args.fwhm,
-                        threshold_sigma=args.threshold, aperture_radius=args.aperture
+                        threshold_sigma=args.threshold, aperture_radius=args.aperture,
+                        cluster_center=cluster_center, cluster_radius=cluster_radius,
+                        aperture_per_star=args.aperture_per_star,
+                        detect_fwhm_scale=args.detect_fwhm_scale
                     ) if datas[0] is not None else (None, None)
                     compare_result2 = detect_and_photometry_wrapper(
                         datas[1], method=compare_method, fwhm=args.fwhm,
-                        threshold_sigma=args.threshold, aperture_radius=args.aperture
+                        threshold_sigma=args.threshold, aperture_radius=args.aperture,
+                        cluster_center=cluster_center, cluster_radius=cluster_radius,
+                        aperture_per_star=args.aperture_per_star,
+                        detect_fwhm_scale=args.detect_fwhm_scale
                     ) if datas[1] is not None else (None, None)
                 except Exception as e:
                     print(f"  WARNUNG: {compare_method}-Photometrie fehlgeschlagen: {e}")
@@ -2689,11 +3329,17 @@ def main(argv: Optional[List[str]] = None) -> int:
                             try:
                                 compare_result1 = detect_and_photometry_wrapper(
                                     datas[0], method=compare_method, fwhm=args.fwhm,
-                                    threshold_sigma=args.threshold, aperture_radius=args.aperture
+                                    threshold_sigma=args.threshold, aperture_radius=args.aperture,
+                                    cluster_center=cluster_center, cluster_radius=cluster_radius,
+                                    aperture_per_star=args.aperture_per_star,
+                                    detect_fwhm_scale=args.detect_fwhm_scale
                                 ) if datas[0] is not None else (None, None)
                                 compare_result2 = detect_and_photometry_wrapper(
                                     datas[1], method=compare_method, fwhm=args.fwhm,
-                                    threshold_sigma=args.threshold, aperture_radius=args.aperture
+                                    threshold_sigma=args.threshold, aperture_radius=args.aperture,
+                                    cluster_center=cluster_center, cluster_radius=cluster_radius,
+                                    aperture_per_star=args.aperture_per_star,
+                                    detect_fwhm_scale=args.detect_fwhm_scale
                                 ) if datas[1] is not None else (None, None)
                             except Exception as e:
                                 print(f"  WARNUNG: {compare_method}-Photometrie fehlgeschlagen: {e}")
