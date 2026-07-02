@@ -50,6 +50,12 @@ CMD speichern:
 python photo.py /pfad/zum/fits-ordner --save-cm cmd.png
 ```
 
+Sternprofile (hell/mittel/dunkel) plus PSF-Fit anzeigen:
+
+```bash
+python photo.py /pfad/zum/fits-ordner --plot-stellar-profiles
+```
+
 Vergleich Apertur vs. PSF als gemeinsamer CMD-Plot:
 
 ```bash
@@ -66,8 +72,14 @@ python photo.py /pfad/zum/fits-ordner --compare-cmd-methods --save-cmd-compare c
   - Speichert den Bildplot der FITS-Frames als PNG.
 - `--aperture FLOAT`
   - Aperturradius in Pixeln. Ohne Angabe: automatische Wahl (empfohlen).
+- `--aperture-per-star`
+  - Passt Apertur/Annulus pro Stern individuell an.
+  - Wenn `--aperture` gesetzt ist, dient dieser Wert als Basis und wird pro Stern skaliert.
 - `--fwhm FLOAT`
   - FWHM fuer Quellenfindung.
+- `--detect-fwhm-scale FLOAT`
+  - Skaliert die FWHM nur fuer die Peak-Erkennung.
+  - Kleinere Werte trennen nahe Sterne besser (z. B. 0.75), koennen aber mehr Fehlpeaks erzeugen.
 - `--threshold FLOAT`
   - Sigma-Schwelle fuer Quellenfindung.
 - `--maxsep FLOAT`
@@ -86,6 +98,8 @@ python photo.py /pfad/zum/fits-ordner --compare-cmd-methods --save-cmd-compare c
   - Isochronen-Anpassung fuer Entfernung/Alter.
 - `--compare-cmd-methods`, `--save-cmd-compare`
   - Direkter Methodenvergleich im CMD.
+- `--plot-stellar-profiles`, `--save-stellar-profiles`
+  - Plot fuer radial gemittelte Sternprofile (hell/mittel/dunkel) inklusive angepasster PSF.
 
 ## Workflow (kurz)
 
@@ -131,6 +145,18 @@ Nachteile:
 - Abhaengig von der Guete des PSF-Modells.
 - Bei Problemen wird im Skript auf Apertur-Photometrie zurueckgefallen.
 
+## Trennung naher Sterne
+
+Wenn zwei helle Sterne sehr nahe beieinander liegen und als ein Peak erkannt werden:
+- `--detect-fwhm-scale` reduzieren (z. B. 0.85 -> 0.75 -> 0.65).
+- `--threshold` bei Bedarf leicht erhoehen, falls zu viele Falsch-Peaks entstehen.
+
+Beispiel:
+
+```bash
+python photo.py /pfad/zum/fits-ordner --fwhm 3.0 --detect-fwhm-scale 0.75
+```
+
 ## Methodenvergleich im Skript
 
 Mit `--compare-cmd-methods` wird ein gemeinsamer CMD-Plot erzeugt:
@@ -151,6 +177,7 @@ Je nach Optionen werden u.a. erzeugt:
 - Bildplot der Frames
 - CMD-Plot
 - CMD-Methodenvergleich
+- Sternprofil/PSF-Plot (`--plot-stellar-profiles`)
 - `calib.txt` (Kalibrierungsdaten)
 - `photometry.txt` (Sternliste mit V und B-V)
 - `cluster_parameters.txt` (bei Isochronen-Fit)

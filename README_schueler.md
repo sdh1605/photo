@@ -44,6 +44,12 @@ Nur Apertur:
 python photo.py /pfad/zum/fits-ordner --photometry-method aperture
 ```
 
+Apertur pro Stern anpassen:
+
+```bash
+python photo.py /pfad/zum/fits-ordner --photometry-method aperture --aperture-per-star
+```
+
 Nur PSF:
 
 ```bash
@@ -66,6 +72,12 @@ Filter aus Kommandozeile erzwingen (Header ignorieren):
 
 ```bash
 python photo.py /pfad/zum/fits-ordner --filters B V --force-filters
+```
+
+Sternprofile (hell/mittel/dunkel) plus PSF-Fit anzeigen:
+
+```bash
+python photo.py /pfad/zum/fits-ordner --plot-stellar-profiles --save-stellar-profiles profile.png
 ```
 
 ## Unterschied: Apertur vs. PSF (einfach erklaert)
@@ -133,6 +145,17 @@ Keine Matches gefunden:
 - --maxsep etwas groesser machen
 - --fwhm und --threshold anpassen
 - Filterzuordnung pruefen (--filters oder --force-filters)
+
+Zwei nahe helle Sterne werden als ein Stern erkannt:
+- --detect-fwhm-scale kleiner setzen (z. B. 0.75)
+- ggf. auch 0.65 testen
+- wenn zu viele falsche Sterne erkannt werden: --threshold leicht erhoehen
+
+Beispiel:
+
+```bash
+python photo.py /pfad/zum/fits-ordner --fwhm 3.0 --detect-fwhm-scale 0.75
+```
 
 Zu viele Farbausreisser im CMD:
 - --outlier-sigma groesser setzen (z.B. 4.0 oder 5.0)
