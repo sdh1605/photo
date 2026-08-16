@@ -1272,14 +1272,16 @@ def match_sources(tab1, tab2, max_sep: float = 5.0, search_radius: float = 100.0
 
 
 def select_reference_star(images, phot_tables, matched_indices, aperture_radius, calibration_file=None, output_folder=None):
-    """Interaktive Auswahl eines Referenzsterns und Eingabe seiner wahren Magnituden.
+    """Interaktive Auswahl eines oder mehrerer Referenzsterne und Eingabe ihrer wahren Magnituden.
     
     Args:
         calibration_file: Optional - Pfad zum Speichern der Kalibrierungsdaten
         output_folder: Optional - Ordner für Ausgabedateien (PNG, etc.)
     
     Returns:
-        (ref_index_B, mag_B_true, mag_V_true, ref_x, ref_y) oder (None, None, None, None, None) bei Abbruch
+        Einzelner Stern: (ref_index_B, mag_B_true, mag_V_true, ref_x, ref_y)
+        Mehrere Sterne: (ref_indices_B, mags_B_true, mags_V_true, ref_xs, ref_ys)
+        oder (None, None, None, None, None) bei Abbruch
     """
     if len(images) < 1 or phot_tables[0] is None:
         print("Keine Daten für Referenzstern-Auswahl verfügbar.")
@@ -1290,7 +1292,7 @@ def select_reference_star(images, phot_tables, matched_indices, aperture_radius,
     
     # Erstelle Plot für interaktive Auswahl
     fig, ax = plt.subplots(figsize=(10, 10))
-    ax.set_title('Klicken Sie auf einen Referenzstern im B-Filter Bild\n(Nur gematchte Sterne werden angezeigt)')
+    ax.set_title('Klicken Sie auf alle Referenzsterne im B-Filter Bild\n(alle Klicks werden gesammelt; Fenster schließen beendet die Auswahl)')
     
     try:
         norm = ImageNormalize(data, interval=ZScaleInterval())
@@ -1308,78 +1310,112 @@ def select_reference_star(images, phot_tables, matched_indices, aperture_radius,
         coords_matched = np.array([])
         indices_B = []
     
-    # Speichere Auswahl
-    selected_ref = {'index': None, 'pos': None}
+    selected_refs = []
+    selected_index_set = set()
     
     def onclick(event):
         if event.inaxes != ax:
             return
+        if len(coords_matched) == 0:
+            return
         
-        # Finde nächsten gematchten Stern
         click_pos = np.array([event.xdata, event.ydata])
         dists = np.linalg.norm(coords_matched - click_pos, axis=1)
-        nearest_idx = np.argmin(dists)
+        nearest_idx = int(np.argmin(dists))
         
         if dists[nearest_idx] < aperture_radius * 3:  # Innerhalb 3x Aperturradius
-            selected_ref['index'] = indices_B[nearest_idx]
-            selected_ref['pos'] = coords_matched[nearest_idx]
+            ref_index = int(indices_B[nearest_idx])
+            ref_pos = coords_matched[nearest_idx]
+            if ref_index in selected_index_set:
+                print(f"Referenzstern mit Index {ref_index} bereits ausgewählt.")
+                return
+            selected_index_set.add(ref_index)
+            selected_refs.append({'index': ref_index, 'pos': ref_pos})
             
-            # Markiere Auswahl
-            ax.plot(selected_ref['pos'][0], selected_ref['pos'][1], 'r*', 
-                   markersize=20, markeredgewidth=2, markeredgecolor='white')
+            ax.plot(ref_pos[0], ref_pos[1], 'r*', markersize=20,
+                   markeredgewidth=2, markeredgecolor='white')
             fig.canvas.draw()
             
-            print(f"\nReferenzstern ausgewählt: Index {selected_ref['index']}, "
-                  f"Position ({selected_ref['pos'][0]:.1f}, {selected_ref['pos'][1]:.1f})")
-            print("Schließen Sie das Fenster um fortzufahren...")
+            print(f"\nReferenzstern {len(selected_refs)} ausgewählt: Index {ref_index}, "
+                  f"Position ({ref_pos[0]:.1f}, {ref_pos[1]:.1f})")
+            print("Klicken Sie weitere Referenzsterne an; das Fenster schließt die Auswahl.")
     
     cid = fig.canvas.mpl_connect('button_press_event', onclick)
     plt.show()
     fig.canvas.mpl_disconnect(cid)
     
-    if selected_ref['index'] is None:
+    if len(selected_refs) == 0:
         print("Kein Referenzstern ausgewählt.")
         return None, None, None, None, None
     
-    # Eingabe der wahren Magnituden
-    print("\n=== Eingabe der wahren Magnituden des Referenzsterns ===")
-    try:
-        mag_B_true = float(input("B-Magnitude des Referenzsterns: "))
-        mag_V_true = float(input("V-Magnitude des Referenzsterns: "))
-    except (ValueError, EOFError):
-        print("Ungültige Eingabe. Kalibrierung abgebrochen.")
-        return None, None, None, None, None
+    print(f"\n=== Eingabe der wahren Magnituden der {len(selected_refs)} Referenzsterne ===")
+    ref_indices = []
+    mag_B_values = []
+    mag_V_values = []
+    ref_x_values = []
+    ref_y_values = []
     
-    print(f"\nReferenzstern kalibriert: B={mag_B_true:.3f} mag, V={mag_V_true:.3f} mag")
+    for i, ref in enumerate(selected_refs, start=1):
+        try:
+            mag_B_true = float(input(f"B-Magnitude des Referenzsterns {i}/{len(selected_refs)} (Index {ref['index']}): "))
+            mag_V_true = float(input(f"V-Magnitude des Referenzsterns {i}/{len(selected_refs)} (Index {ref['index']}): "))
+        except (ValueError, EOFError):
+            print("Ungültige Eingabe. Kalibrierung abgebrochen.")
+            return None, None, None, None, None
+        
+        ref_indices.append(ref['index'])
+        mag_B_values.append(mag_B_true)
+        mag_V_values.append(mag_V_true)
+        ref_x_values.append(ref['pos'][0])
+        ref_y_values.append(ref['pos'][1])
+        print(f"  Referenzstern {i}: B={mag_B_true:.3f} mag, V={mag_V_true:.3f} mag")
     
-    # Speichere Bild mit markiertem Referenzstern
+    # Speichere Bild mit markierten Referenzsternen
     if output_folder:
-        png_path = get_output_path(output_folder, 'reference_star.png')
+        png_path = get_output_path(output_folder, 'reference_stars.png')
         try:
             fig.savefig(png_path, dpi=150, bbox_inches='tight')
-            print(f"Bild mit Referenzstern gespeichert: {png_path}")
+            print(f"Bild mit Referenzsternen gespeichert: {png_path}")
         except Exception as e:
             print(f"WARNUNG: Konnte Bild nicht speichern: {e}", file=sys.stderr)
     
     # Speichere Kalibrierungsdaten falls Datei angegeben
     if calibration_file:
-        save_calibration(calibration_file, selected_ref['index'], 
-                        selected_ref['pos'][0], selected_ref['pos'][1],
-                        mag_B_true, mag_V_true)
-    
-    return selected_ref['index'], mag_B_true, mag_V_true, selected_ref['pos'][0], selected_ref['pos'][1]
+        save_calibration(calibration_file, ref_indices, ref_x_values, ref_y_values, mag_B_values, mag_V_values)
+
+    if len(ref_indices) == 1:
+        idx = ref_indices[0]
+        return idx, mag_B_values[0], mag_V_values[0], ref_x_values[0], ref_y_values[0]
+
+    return np.array(ref_indices, dtype=int), np.array(mag_B_values, dtype=float), np.array(mag_V_values, dtype=float), np.array(ref_x_values, dtype=float), np.array(ref_y_values, dtype=float)
 
 
 def save_calibration(filename, ref_index, ref_x, ref_y, mag_B, mag_V):
-    """Speichere Kalibrierungsdaten in einer Textdatei."""
+    """Speichere Kalibrierungsdaten in einer Textdatei.
+
+    Unterstützt einen einzelnen Stern oder mehrere Sterne pro Datei.
+    """
     try:
+        if np.isscalar(ref_index) or isinstance(ref_index, (int, np.integer)):
+            ref_rows = [(int(ref_index), float(ref_x), float(ref_y), float(mag_B), float(mag_V))]
+        else:
+            ref_rows = []
+            ref_index_arr = np.atleast_1d(ref_index)
+            ref_x_arr = np.atleast_1d(ref_x)
+            ref_y_arr = np.atleast_1d(ref_y)
+            mag_B_arr = np.atleast_1d(mag_B)
+            mag_V_arr = np.atleast_1d(mag_V)
+            for i in range(len(ref_index_arr)):
+                ref_rows.append((int(ref_index_arr[i]), float(ref_x_arr[i]), float(ref_y_arr[i]), float(mag_B_arr[i]), float(mag_V_arr[i])))
+
         with open(filename, 'w') as f:
             f.write("# Photometrie Kalibrierungsdatei\n")
             f.write(f"# Erstellt am: {np.datetime64('now')}\n")
             f.write("#\n")
             f.write("# Format: ref_index ref_x ref_y mag_B mag_V\n")
-            f.write(f"{ref_index} {ref_x:.6f} {ref_y:.6f} {mag_B:.6f} {mag_V:.6f}\n")
-        print(f"Kalibrierungsdaten gespeichert in: {filename}")
+            for ref_idx, x_coord, y_coord, b_mag, v_mag in ref_rows:
+                f.write(f"{ref_idx} {x_coord:.6f} {y_coord:.6f} {b_mag:.6f} {v_mag:.6f}\n")
+        print(f"Kalibrierungsdaten gespeichert in: {filename} ({len(ref_rows)} Referenzsterne)")
     except Exception as e:
         print(f"WARNUNG: Konnte Kalibrierungsdaten nicht speichern: {e}", file=sys.stderr)
 
@@ -1424,8 +1460,11 @@ def load_calibration(filename, phot_tables, matched_indices):
     """Lade Kalibrierungsdaten aus einer Textdatei.
     
     Returns:
-        (ref_index_B, mag_B_true, mag_V_true, ref_x, ref_y) oder (None, None, None, None, None) bei Fehler
+        Ein einzelner Stern: (ref_index_B, mag_B_true, mag_V_true, ref_x, ref_y)
+        Mehrere Sterne: (ref_indices_B, mags_B_true, mags_V_true, ref_xs, ref_ys)
+        oder (None, None, None, None, None) bei Fehler
     """
+    entries = []
     try:
         with open(filename, 'r') as f:
             for line in f:
@@ -1440,54 +1479,70 @@ def load_calibration(filename, phot_tables, matched_indices):
                     ref_y = float(parts[2])
                     mag_B = float(parts[3])
                     mag_V = float(parts[4])
-                    
-                    print(f"Kalibrierungsdaten geladen aus: {filename}")
-                    print(f"  Referenzstern (gespeichert): Index {ref_index}, Position ({ref_x:.1f}, {ref_y:.1f})")
-                    print(f"  Magnituden: B={mag_B:.3f}, V={mag_V:.3f}")
+                    entries.append((ref_index, ref_x, ref_y, mag_B, mag_V))
 
-                    # WICHTIG: Der gespeicherte Index ist zwischen Läufen nicht stabil,
-                    # besonders bei anderem threshold. Daher primär über (x, y) remappen.
-                    mapped_ref_index = ref_index
+        if len(entries) == 0:
+            print(f"FEHLER: Keine gültigen Kalibrierungsdaten in {filename} gefunden.")
+            return None, None, None, None, None
 
-                    if phot_tables and phot_tables[0] is not None:
-                        tabB = phot_tables[0]
-                        coords = np.vstack((np.array(tabB['x']), np.array(tabB['y']))).T
-                        ref_pos = np.array([ref_x, ref_y])
-                        dists = np.linalg.norm(coords - ref_pos, axis=1)
-                        nearest_idx = int(np.argmin(dists))
-                        nearest_dist = float(dists[nearest_idx])
+        loaded_ref_indices = []
+        loaded_mag_B = []
+        loaded_mag_V = []
+        loaded_x = []
+        loaded_y = []
 
-                        # Nutze die Koordinaten-basierte Zuordnung, sofern plausibel.
-                        # 8 Pixel ist konservativ genug für kleine Transformationsreste.
-                        if nearest_dist <= 8.0:
-                            mapped_ref_index = nearest_idx
-                            print(f"  Referenzstern remapped über Koordinaten: Index {mapped_ref_index} (Δ={nearest_dist:.2f} px)")
-                        else:
-                            print(f"WARNUNG: Nächster Stern liegt {nearest_dist:.2f} px entfernt. Verwende gespeicherten Index {ref_index}.")
+        for ref_index, ref_x, ref_y, mag_B, mag_V in entries:
+            print(f"Kalibrierungsdaten geladen aus: {filename}")
+            print(f"  Referenzstern (gespeichert): Index {ref_index}, Position ({ref_x:.1f}, {ref_y:.1f})")
+            print(f"  Magnituden: B={mag_B:.3f}, V={mag_V:.3f}")
 
-                    # Stelle sicher, dass der Referenzstern in den Matches ist.
-                    # Falls nicht, nimm den räumlich nächsten gematchten B-Stern.
-                    if matched_indices:
-                        found = any(idx1 == mapped_ref_index for idx1, idx2 in matched_indices)
-                        if not found and phot_tables and phot_tables[0] is not None:
-                            tabB = phot_tables[0]
-                            coords = np.vstack((np.array(tabB['x']), np.array(tabB['y']))).T
-                            ref_pos = np.array([ref_x, ref_y])
-                            matched_b = np.array([idx1 for idx1, _ in matched_indices], dtype=int)
-                            matched_coords = coords[matched_b]
-                            dists_m = np.linalg.norm(matched_coords - ref_pos, axis=1)
-                            j = int(np.argmin(dists_m))
-                            mapped_ref_index = int(matched_b[j])
-                            print(f"  Referenzstern auf nächsten gematchten B-Stern gelegt: Index {mapped_ref_index} (Δ={dists_m[j]:.2f} px)")
-                        elif not found:
-                            print("WARNUNG: Referenzstern ist nicht in den gematchten Sternen und konnte nicht remapped werden.")
-                            return None, None, None, None, None
+            mapped_ref_index = ref_index
 
-                    return mapped_ref_index, mag_B, mag_V, ref_x, ref_y
-        
-        print(f"FEHLER: Keine gültigen Kalibrierungsdaten in {filename} gefunden.")
-        return None, None, None, None, None
-    
+            if phot_tables and phot_tables[0] is not None:
+                tabB = phot_tables[0]
+                coords = np.vstack((np.array(tabB['x']), np.array(tabB['y']))).T
+                ref_pos = np.array([ref_x, ref_y])
+                dists = np.linalg.norm(coords - ref_pos, axis=1)
+                nearest_idx = int(np.argmin(dists))
+                nearest_dist = float(dists[nearest_idx])
+
+                if nearest_dist <= 8.0:
+                    mapped_ref_index = nearest_idx
+                    print(f"  Referenzstern remapped über Koordinaten: Index {mapped_ref_index} (Δ={nearest_dist:.2f} px)")
+                else:
+                    print(f"WARNUNG: Nächster Stern liegt {nearest_dist:.2f} px entfernt. Verwende gespeicherten Index {ref_index}.")
+
+            if matched_indices:
+                found = any(idx1 == mapped_ref_index for idx1, idx2 in matched_indices)
+                if not found and phot_tables and phot_tables[0] is not None:
+                    tabB = phot_tables[0]
+                    coords = np.vstack((np.array(tabB['x']), np.array(tabB['y']))).T
+                    ref_pos = np.array([ref_x, ref_y])
+                    matched_b = np.array([idx1 for idx1, _ in matched_indices], dtype=int)
+                    matched_coords = coords[matched_b]
+                    dists_m = np.linalg.norm(matched_coords - ref_pos, axis=1)
+                    j = int(np.argmin(dists_m))
+                    mapped_ref_index = int(matched_b[j])
+                    print(f"  Referenzstern auf nächsten gematchten B-Stern gelegt: Index {mapped_ref_index} (Δ={dists_m[j]:.2f} px)")
+                elif not found:
+                    print("WARNUNG: Referenzstern ist nicht in den gematchten Sternen und konnte nicht remapped werden.")
+                    return None, None, None, None, None
+
+            loaded_ref_indices.append(mapped_ref_index)
+            loaded_mag_B.append(mag_B)
+            loaded_mag_V.append(mag_V)
+            loaded_x.append(ref_x)
+            loaded_y.append(ref_y)
+
+        if len(loaded_ref_indices) == 1:
+            return loaded_ref_indices[0], loaded_mag_B[0], loaded_mag_V[0], loaded_x[0], loaded_y[0]
+
+        return (np.array(loaded_ref_indices, dtype=int),
+                np.array(loaded_mag_B, dtype=float),
+                np.array(loaded_mag_V, dtype=float),
+                np.array(loaded_x, dtype=float),
+                np.array(loaded_y, dtype=float))
+
     except FileNotFoundError:
         print(f"FEHLER: Kalibrierungsdatei nicht gefunden: {filename}")
         return None, None, None, None, None
@@ -1497,48 +1552,71 @@ def load_calibration(filename, phot_tables, matched_indices):
 
 
 def calibrate_magnitudes(matched, tabB, tabV, ref_index_B, mag_B_true, mag_V_true):
-    """Kalibriere alle Magnituden basierend auf einem Referenzstern.
+    """Kalibriere alle Magnituden basierend auf einem oder mehreren Referenzsternen.
     
     Returns:
         (calibrated_mags_B, calibrated_mags_V, colors_BV, matched_indices_valid)
     """
     sumsB = np.asarray(tabB['aperture_sum_bkgsub'])
     sumsV = np.asarray(tabV['aperture_sum_bkgsub'])
-    
-    # Finde den Referenzstern in den Matches
-    ref_match_idx = None
-    for i, (iB, iV) in enumerate(matched):
-        if iB == ref_index_B:
-            ref_match_idx = i
-            ref_index_V = iV
-            break
-    
-    if ref_match_idx is None:
-        print("FEHLER: Referenzstern nicht in den Matches gefunden!")
+
+    if isinstance(ref_index_B, (list, tuple, np.ndarray)):
+        ref_entries = []
+        ref_idx_array = np.atleast_1d(ref_index_B)
+        mag_B_array = np.atleast_1d(mag_B_true)
+        mag_V_array = np.atleast_1d(mag_V_true)
+        for i in range(len(ref_idx_array)):
+            ref_entries.append((int(ref_idx_array[i]), float(mag_B_array[i]), float(mag_V_array[i])))
+    else:
+        ref_entries = [(int(ref_index_B), float(mag_B_true), float(mag_V_true))]
+
+    zeropoint_B_values = []
+    zeropoint_V_values = []
+
+    for ref_index, mag_B_target, mag_V_target in ref_entries:
+        ref_match_idx = None
+        ref_index_V = None
+        for i, (iB, iV) in enumerate(matched):
+            if iB == ref_index:
+                ref_match_idx = i
+                ref_index_V = iV
+                break
+
+        if ref_match_idx is None:
+            print(f"FEHLER: Referenzstern {ref_index} nicht in den Matches gefunden!")
+            return None, None, None, None
+
+        ref_flux_B = sumsB[ref_index]
+        ref_flux_V = sumsV[ref_index_V]
+
+        if ref_flux_B <= 0 or ref_flux_V <= 0:
+            print(f"FEHLER: Referenzstern {ref_index} hat negativen oder Null-Flux!")
+            return None, None, None, None
+
+        mag_B_inst_ref = -2.5 * np.log10(ref_flux_B)
+        mag_V_inst_ref = -2.5 * np.log10(ref_flux_V)
+
+        zeropoint_B = mag_B_target - mag_B_inst_ref
+        zeropoint_V = mag_V_target - mag_V_inst_ref
+        zeropoint_B_values.append(zeropoint_B)
+        zeropoint_V_values.append(zeropoint_V)
+
+        print(f"\n=== Referenzstern {ref_index} ===")
+        print(f"B_true = {mag_B_target:.3f}, V_true = {mag_V_target:.3f}, (B-V)_true = {mag_B_target - mag_V_target:.3f}")
+        print(f"Instrumentale Magnituden: B_inst = {mag_B_inst_ref:.3f}, V_inst = {mag_V_inst_ref:.3f}")
+        print(f"Nullpunkte: ZP_B = {zeropoint_B:.3f} mag, ZP_V = {zeropoint_V:.3f} mag")
+
+    if len(zeropoint_B_values) == 0:
+        print("FEHLER: Keine gültigen Referenzsterne für die Kalibrierung verfügbar.")
         return None, None, None, None
-    
-    # Berechne instrumentale Magnituden des Referenzsterns
-    ref_flux_B = sumsB[ref_index_B]
-    ref_flux_V = sumsV[ref_index_V]
-    
-    if ref_flux_B <= 0 or ref_flux_V <= 0:
-        print("FEHLER: Referenzstern hat negativen oder Null-Flux!")
-        return None, None, None, None
-    
-    mag_B_inst_ref = -2.5 * np.log10(ref_flux_B)
-    mag_V_inst_ref = -2.5 * np.log10(ref_flux_V)
-    
-    # Berechne Nullpunkte
-    zeropoint_B = mag_B_true - mag_B_inst_ref
-    zeropoint_V = mag_V_true - mag_V_inst_ref
-    
+
+    zeropoint_B = float(np.median(zeropoint_B_values))
+    zeropoint_V = float(np.median(zeropoint_V_values))
+
     print(f"\n=== Kalibrierung Debug ===")
-    print(f"Referenzstern: B_true = {mag_B_true:.3f}, V_true = {mag_V_true:.3f}, (B-V)_true = {mag_B_true - mag_V_true:.3f}")
-    print(f"Instrumentale Magnituden: B_inst = {mag_B_inst_ref:.3f}, V_inst = {mag_V_inst_ref:.3f}")
-    print(f"Nullpunkte: ZP_B = {zeropoint_B:.3f} mag, ZP_V = {zeropoint_V:.3f} mag")
+    print(f"Verwendete Nullpunkte (Median über {len(zeropoint_B_values)} Referenzsterne): ZP_B = {zeropoint_B:.3f} mag, ZP_V = {zeropoint_V:.3f} mag")
     print(f"Differenz: ZP_V - ZP_B = {zeropoint_V - zeropoint_B:.3f} mag")
     
-    # Kalibriere alle Sterne
     mags_B = []
     mags_V = []
     colors = []
