@@ -646,37 +646,65 @@ def plot_star_profile_psf_samples(data: np.ndarray, phot_table, fwhm: float,
         r, y_prof, bkg = prof
         fit = _fit_gaussian_psf_to_profile(r, y_prof, fwhm_hint=fwhm)
 
-        ax.plot(r, y_prof, 'o', ms=3.8, alpha=0.8, label='Azimutal gemitteltes Profil')
         if fit is not None:
             amp, fwhm_fit, model = fit
-            ax.plot(r, model, '-', lw=2.0, label=f'Gauß-PSF-Fit (FWHM={fwhm_fit:.2f}px)')
-            ax.text(0.03, 0.97, f"A={amp:.1f}\nBkg={bkg:.1f}", transform=ax.transAxes,
+            peak_value = float(np.nanmax(model)) if np.any(np.isfinite(model)) else float(np.nanmax(y_prof))
+            half_level = 0.5 * peak_value
+
+            mirrored_r = np.concatenate((-r[::-1], r))
+            mirrored_y = np.concatenate((y_prof[::-1], y_prof))
+            mirrored_model = np.concatenate((model[::-1], model))
+
+            ax.plot(mirrored_r, mirrored_y, 'o', ms=3.8, alpha=0.8, label='Azimutal gemitteltes Profil')
+            ax.plot(mirrored_r, mirrored_model, '-', lw=2.0, label=f'Gauß-PSF-Fit (FWHM={fwhm_fit:.2f}px)')
+
+            half_max_y = half_level
+            fwhm_half = 0.5 * fwhm_fit
+            x_span_left = -fwhm_half
+            x_span_right = fwhm_half
+
+            ax.axhline(half_level, color='tab:red', ls='--', lw=1.2, alpha=0.8, label='Half-max')
+            ax.plot([x_span_left, x_span_right], [half_level, half_level], color='tab:red', lw=2.0, alpha=0.9)
+            ax.vlines([x_span_left, x_span_right], ymin=0.0, ymax=half_level, colors='tab:red', linestyles='--', lw=1.2)
+            ax.annotate(f'FWHM={fwhm_fit:.2f}px', xy=(0.0, half_level), xytext=(0.02, 0.94),
+                        textcoords='axes fraction', color='tab:red', fontsize=8,
+                        bbox=dict(boxstyle='round', facecolor='white', alpha=0.8, edgecolor='tab:red'))
+            ax.text(0.03, 0.80, f"A={amp:.1f}\nBkg={bkg:.1f}", transform=ax.transAxes,
                     va='top', ha='left', fontsize=8,
                     bbox=dict(boxstyle='round', facecolor='white', alpha=0.85, edgecolor='0.7'))
         else:
+            mirrored_r = np.concatenate((-r[::-1], r))
+            mirrored_y = np.concatenate((y_prof[::-1], y_prof))
+            ax.plot(mirrored_r, mirrored_y, 'o', ms=3.8, alpha=0.8, label='Azimutal gemitteltes Profil')
             ax.text(0.03, 0.97, f"Kein stabiler PSF-Fit\nBkg={bkg:.1f}", transform=ax.transAxes,
                     va='top', ha='left', fontsize=8,
                     bbox=dict(boxstyle='round', facecolor='white', alpha=0.85, edgecolor='0.7'))
 
         ax.set_title(f"{name}\n(x={x:.1f}, y={y:.1f})")
         ax.set_xlabel('Radius [Pixel]')
+        ax.set_ylabel('Signal über Hintergrund [ADU]')
+        ax.axvline(0, color='gray', lw=0.9, alpha=0.6)
+        x_limit = max(rmax, 3.5 * fwhm if fit is not None else rmax)
+        ax.set_xlim(-x_limit, x_limit)
 
         # Eigene y-Skalierung pro Panel, damit mittlere/schwache Sterne sichtbar bleiben.
-        y_vals = y_prof[np.isfinite(y_prof)]
+        y_vals = np.concatenate((y_prof[::-1], y_prof)) if np.isfinite(y_prof).any() else np.array([])
         if fit is not None:
-            y_model = model[np.isfinite(model)]
-            y_vals = np.concatenate([y_vals, y_model]) if y_model.size > 0 else y_vals
+            y_model = np.concatenate((model[::-1], model)) if np.isfinite(model).any() else np.array([])
+            y_vals = np.concatenate([y_vals, y_model]) if y_model.size > 0 and y_vals.size > 0 else y_vals if y_vals.size > 0 else y_model
         if y_vals.size > 0:
-            y_lo = float(np.nanpercentile(y_vals, 2))
-            y_hi = float(np.nanpercentile(y_vals, 99))
-            if not np.isfinite(y_lo) or not np.isfinite(y_hi) or y_hi <= y_lo:
-                y_lo = float(np.nanmin(y_vals))
-                y_hi = float(np.nanmax(y_vals))
-            if np.isfinite(y_lo) and np.isfinite(y_hi) and y_hi > y_lo:
-                pad = 0.10 * (y_hi - y_lo)
-                if y_hi > 0 and y_lo >= 0:
-                    y_lo = -0.05 * y_hi
-                ax.set_ylim(y_lo - pad, y_hi + pad)
+            y_vals = y_vals[np.isfinite(y_vals)]
+            if y_vals.size > 0:
+                y_lo = float(np.nanpercentile(y_vals, 2))
+                y_hi = float(np.nanpercentile(y_vals, 99))
+                if not np.isfinite(y_lo) or not np.isfinite(y_hi) or y_hi <= y_lo:
+                    y_lo = float(np.nanmin(y_vals))
+                    y_hi = float(np.nanmax(y_vals))
+                if np.isfinite(y_lo) and np.isfinite(y_hi) and y_hi > y_lo:
+                    pad = 0.10 * (y_hi - y_lo)
+                    if y_hi > 0 and y_lo >= 0:
+                        y_lo = -0.05 * y_hi
+                    ax.set_ylim(y_lo - pad, y_hi + pad)
 
         ax.grid(alpha=0.3)
         ax.legend(fontsize=8, loc='upper right')
