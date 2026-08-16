@@ -93,7 +93,10 @@ python photo.py /pfad/zum/fits-ordner --compare-cmd-methods --save-cmd-compare c
 - `--cluster-radius`, `--cluster-center`, `--annulus-radii`
   - Raeumliche Selektion von Sternen.
 - `--calibrate`, `--calibrate-file`
-  - Referenzstern-Kalibrierung laden/speichern.
+  - Interaktive Referenzstern-Kalibrierung laden/speichern.
+  - Es koennen mehrere Referenzsterne per Klick ausgewaehlt werden.
+  - Fuer jeden Referenzstern werden B- und V-Magnituden abgefragt.
+  - Die Kalibrierung verwendet dann den Median der einzelnen Nullpunkte.
 - `--fit-isochrone`, `--ebv`, `--age-range`, `--age`
   - Isochronen-Anpassung fuer Entfernung/Alter.
 - `--compare-cmd-methods`, `--save-cmd-compare`
@@ -109,8 +112,28 @@ python photo.py /pfad/zum/fits-ordner --compare-cmd-methods --save-cmd-compare c
 4. Sterne zwischen beiden Bildern robust matchen.
 5. B und V zuordnen.
 6. CMD erstellen (instrumentell oder kalibriert).
-7. Optional: Dereddening und Isochrone.
-8. Optional: Methodenvergleich Apertur vs. PSF mit Linien und Abweichungs-Statistik.
+7. Optional: Mehrere Referenzsterne auswaehlen und kalibrieren.
+8. Optional: Dereddening und Isochrone.
+9. Optional: Methodenvergleich Apertur vs. PSF mit Linien und Abweichungs-Statistik.
+
+## Mehrere Referenzsterne kalibrieren
+
+Bei `--calibrate` kann der Nutzer nun mehrere Referenzsterne interaktiv auswaehlen:
+
+- Bild oeffnen und beliebig viele passende Sterne per Klick markieren
+- fuer jeden Klick nach B- und V-Magnitude fragen
+- Messwerte aller gewaehlten Sterne in einem gemeinsamen Kalibrierungs-File speichern
+- die Kalibrierung wird aus dem Median der einzelnen Nullpunkt-Loesungen bestimmt
+
+Das Format der Kalibrierungsdatei bleibt kompatibel zum bisherigen Einzelstern-Format, erweitert aber auf mehrere Zeilen pro Datei:
+
+```text
+# Format: ref_index ref_x ref_y mag_B mag_V
+12 123.45 456.78 12.345 11.234
+27 200.12 410.66 12.890 11.770
+```
+
+Einzelne Referenzsterne funktionieren weiterhin genauso wie bisher.
 
 ## Unterschied: Apertur vs. PSF-Photometrie
 
@@ -178,7 +201,7 @@ Je nach Optionen werden u.a. erzeugt:
 - CMD-Plot
 - CMD-Methodenvergleich
 - Sternprofil/PSF-Plot (`--plot-stellar-profiles`)
-- `calib.txt` (Kalibrierungsdaten)
+- `calib.txt` (Kalibrierungsdaten; auch mehrere Referenzsterne pro Datei moeglich)
 - `photometry.txt` (Sternliste mit V und B-V)
 - `cluster_parameters.txt` (bei Isochronen-Fit)
 - `isochrone_fit.png` (bei Isochronen-Fit)
