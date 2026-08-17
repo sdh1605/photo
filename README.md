@@ -25,6 +25,28 @@ Beispiel-Installation:
 pip install numpy matplotlib astropy photutils
 ```
 
+## Einheitliche Entwicklungsumgebung mit Dev Container
+
+Im Repository ist unter `/home/runner/work/photo/photo/.devcontainer/devcontainer.json` eine Dev-Container-Konfiguration hinterlegt.
+Damit kann das Projekt in GitHub Codespaces oder in VS Code per "Reopen in Container" mit einer vorbereiteten Python-Umgebung gestartet werden.
+
+Der Container:
+- verwendet Python 3.12,
+- installiert die Abhängigkeiten aus `/home/runner/work/photo/photo/requirements.txt`,
+- empfiehlt die VS-Code-Erweiterungen für Python, Jupyter und GitHub Copilot.
+
+Lokal in VS Code:
+
+1. Repository öffnen
+2. Befehl "Dev Containers: Reopen in Container" ausführen
+3. Nach dem Container-Start `python photo.py --help` verwenden
+
+In GitHub:
+
+1. Repository öffnen
+2. Auf **Code** -> **Codespaces** gehen
+3. Einen neuen Codespace erstellen
+
 ## Schnellstart
 
 ```bash
