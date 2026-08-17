@@ -21,7 +21,7 @@ Wichtig:
 ## Schnellstart
 
 Wenn du in GitHub Codespaces oder mit VS Code Dev Containers arbeitest, kannst du direkt die im Repository enthaltene Container-Umgebung nutzen.
-Sie installiert automatisch die Python-Pakete aus `/home/runner/work/photo/photo/requirements.txt`.
+Sie installiert automatisch die Python-Pakete aus `requirements.txt`.
 
 ```bash
 python photo.py /pfad/zum/fits-ordner
