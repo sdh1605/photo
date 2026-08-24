@@ -442,8 +442,8 @@ def _estimate_global_profile_radii(data: np.ndarray,
     if candidate_idx is None or len(candidate_idx) == 0:
         return None
 
-    src_x = np.asarray(sources['xcentroid'], dtype=float)
-    src_y = np.asarray(sources['ycentroid'], dtype=float)
+    src_x = np.asarray(sources['x_centroid'], dtype=float)
+    src_y = np.asarray(sources['y_centroid'], dtype=float)
 
     if 'flux' in sources.colnames:
         brightness = np.asarray(sources['flux'], dtype=float)
@@ -770,8 +770,8 @@ def detect_and_photometry(data: np.ndarray, fwhm: float = 3.0, threshold_sigma: 
     auto_aperture_requested = aperture_radius is None
 
     if aperture_radius is None:
-        src_x = np.asarray(sources['xcentroid'], dtype=float)
-        src_y = np.asarray(sources['ycentroid'], dtype=float)
+        src_x = np.asarray(sources['x_centroid'], dtype=float)
+        src_y = np.asarray(sources['y_centroid'], dtype=float)
 
         if cluster_center is not None and cluster_radius is not None and cluster_radius > 0:
             dist = np.sqrt((src_x - cluster_center[0]) ** 2 + (src_y - cluster_center[1]) ** 2)
@@ -805,7 +805,7 @@ def detect_and_photometry(data: np.ndarray, fwhm: float = 3.0, threshold_sigma: 
         print(f"  Manuelle Apertur: radius = {aperture_radius:.1f} Pixel")
 
     # Verwende Zentren der Quellen für Aperturphotometrie
-    positions = list(zip(sources['xcentroid'], sources['ycentroid']))
+    positions = list(zip(sources['x_centroid'], sources['y_centroid']))
 
     # Optional: adaptive Aperturen pro Stern basierend auf jeweiligem Sternprofil.
     # WICHTIG: Auch mit gesetztem --aperture aktiv. Dann dient --aperture als Basisradius.
@@ -825,8 +825,8 @@ def detect_and_photometry(data: np.ndarray, fwhm: float = 3.0, threshold_sigma: 
         elif 'peak' in sources.colnames:
             brightness = np.asarray(sources['peak'], dtype=float)
         else:
-            x_idx = np.clip(np.round(np.asarray(sources['xcentroid'], dtype=float)).astype(int), 0, data.shape[1] - 1)
-            y_idx = np.clip(np.round(np.asarray(sources['ycentroid'], dtype=float)).astype(int), 0, data.shape[0] - 1)
+            x_idx = np.clip(np.round(np.asarray(sources['x_centroid'], dtype=float)).astype(int), 0, data.shape[1] - 1)
+            y_idx = np.clip(np.round(np.asarray(sources['y_centroid'], dtype=float)).astype(int), 0, data.shape[0] - 1)
             brightness = np.asarray(data[y_idx, x_idx], dtype=float)
 
         finite_brightness = brightness[np.isfinite(brightness) & (brightness > 0)]
@@ -897,8 +897,8 @@ def detect_and_photometry(data: np.ndarray, fwhm: float = 3.0, threshold_sigma: 
 
         phot_table = sources.copy()
         phot_table['aperture_sum'] = aperture_sum
-        phot_table['x'] = sources['xcentroid']
-        phot_table['y'] = sources['ycentroid']
+        phot_table['x'] = sources['x_centroid']
+        phot_table['y'] = sources['y_centroid']
         phot_table['sky_median'] = bkg_median
         phot_table['aperture_sum_bkgsub'] = aperture_sum_bkgsub
         phot_table['aperture_radius_used'] = per_aperture
@@ -942,8 +942,8 @@ def detect_and_photometry(data: np.ndarray, fwhm: float = 3.0, threshold_sigma: 
     aperture_sum_bkgsub = phot_table['aperture_sum'] - total_bkg
     
     # Füge alle Informationen zur Tabelle hinzu
-    phot_table['x'] = sources['xcentroid']
-    phot_table['y'] = sources['ycentroid']
+    phot_table['x'] = sources['x_centroid']
+    phot_table['y'] = sources['y_centroid']
     phot_table['sky_median'] = bkg_median
     phot_table['aperture_sum_bkgsub'] = aperture_sum_bkgsub
     
@@ -1029,12 +1029,12 @@ def detect_and_psf_photometry(data: np.ndarray, fwhm: float = 3.0, threshold_sig
         if 'x_fit' in phot_table.colnames:
             phot_table['x'] = phot_table['x_fit']
         else:
-            phot_table['x'] = sources['xcentroid']
+            phot_table['x'] = sources['x_centroid']
             
         if 'y_fit' in phot_table.colnames:
             phot_table['y'] = phot_table['y_fit']
         else:
-            phot_table['y'] = sources['ycentroid']
+            phot_table['y'] = sources['y_centroid']
         
         # Benenne Flux-Spalte um zur Kompatibilität
         if 'flux_fit' in phot_table.colnames:
@@ -1062,7 +1062,7 @@ def detect_and_psf_photometry(data: np.ndarray, fwhm: float = 3.0, threshold_sig
     except Exception as e:
         print(f"  Warnung: PSF-Photometrie fehlgeschlagen ({type(e).__name__}: {e}). Fallback auf Aperturphotometrie...")
         # Fallback auf Aperturphotometrie
-        positions = list(zip(sources['xcentroid'], sources['ycentroid']))
+        positions = list(zip(sources['x_centroid'], sources['y_centroid']))
         apertures = CircularAperture(positions, r=aperture_radius)
         phot_table = aperture_photometry(data, apertures)
         
@@ -1084,8 +1084,8 @@ def detect_and_psf_photometry(data: np.ndarray, fwhm: float = 3.0, threshold_sig
         total_bkg = bkg_median * aperture_area
         aperture_sum_bkgsub = phot_table['aperture_sum'] - total_bkg
         
-        phot_table['x'] = sources['xcentroid']
-        phot_table['y'] = sources['ycentroid']
+        phot_table['x'] = sources['x_centroid']
+        phot_table['y'] = sources['y_centroid']
         phot_table['sky_median'] = bkg_median
         phot_table['aperture_sum_bkgsub'] = aperture_sum_bkgsub
         
@@ -1213,6 +1213,7 @@ def match_sources(tab1, tab2, max_sep: float = 5.0, search_radius: float = 100.0
     
     best_offset = None
     best_n_matches = 0
+    rng = np.random.default_rng(0)
     
     # RANSAC-artiger Ansatz: Teste verschiedene Hypothesen
     # Verwende bevorzugt Sterne innerhalb des Radius für die Offset-Bestimmung
@@ -1225,15 +1226,15 @@ def match_sources(tab1, tab2, max_sep: float = 5.0, search_radius: float = 100.0
             i1_bright = iteration
         else:
             # Später: zufällige Auswahl, bevorzuge Sterne im Radius
-            if indices1_in_radius is not None and len(indices1_in_radius) > 0 and np.random.random() < 0.7:
+            if indices1_in_radius is not None and len(indices1_in_radius) > 0 and rng.random() < 0.7:
                 # 70% Chance: wähle einen Stern im Radius
                 candidates = [i for i in range(n_bright) if indices1_bright[i] in indices1_in_radius]
                 if candidates:
-                    i1_bright = np.random.choice(candidates)
+                    i1_bright = rng.choice(candidates)
                 else:
-                    i1_bright = np.random.randint(0, n_bright)
+                    i1_bright = rng.integers(0, n_bright)
             else:
-                i1_bright = np.random.randint(0, n_bright)
+                i1_bright = rng.integers(0, n_bright)
         
         star1 = coords1_bright[i1_bright]
         

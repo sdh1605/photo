@@ -8,5 +8,4 @@
 7. CMD speichern: python photo.py /pfad --save-cm cmd.png
 8. Methodenvergleich: python photo.py /pfad --compare-cmd-methods --save-cmd-compare cmp.png
 9. Sternprofil+PSF Plot: python photo.py /pfad --plot-stellar-profiles --save-stellar-profiles profile.png
-10. Mehrere Referenzsterne kalibrieren: python photo.py /pfad --calibrate --calibrate-file calib.txt
-11. Kalibrieren + Isochrone: python photo.py /pfad --calibrate --fit-isochrone --ebv 0.05
+10. Kalibrieren + Isochrone: python photo.py /pfad --calibrate --fit-isochrone --ebv 0.05

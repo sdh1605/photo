@@ -125,15 +125,8 @@ Zusaetzlich stehen im Plot/Terminal:
 
 ## Kalibrierung (optional)
 
-Mit --calibrate kannst du Referenzsterne auswaehlen.
-Das Programm erlaubt jetzt auch mehrere Referenzsterne: Du klickst mehrere passende Sterne im Bild an und gibst fuer jeden Stern die B- und V-Helligkeit ein.
-Danach werden die einzelnen Nullpunkte zusammengefasst und das CMD wird mit einer stabileren Kalibrierung berechnet.
-
-Beispiel:
-
-```bash
-python photo.py /pfad/zum/fits-ordner --calibrate --calibrate-file calib.txt
-```
+Mit --calibrate kannst du einen Referenzstern auswaehlen.
+Dann werden aus instrumentellen Werten echte Magnituden.
 
 ## Dereddening (optional)
 
