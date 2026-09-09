@@ -1,0 +1,3999 @@
+#!/usr/bin/env python3
+"""
+photo.py
+
+CLI-Tool (Deutsch): Suche in einem Verzeichnis nach zwei FITS-Dateien, lade sie und zeige sie an.
+
+Verwendung:
+  python photo.py /pfad/zum/ordner
+
+Optionen:
+  -i, --indices   Indices (0-basiert) der anzuzeigenden FITS-Dateien
+  -s, --save      Optionaler Pfad zum Speichern der Abbildung (PNG)
+  -v, --verbose   Mehr Ausgaben
+  --photometry-method METHOD  Photometrie-Methode: 'aperture' oder 'psf' (Standard: aperture)
+  --aperture FLOAT    Aperturradius in Pixel (wenn nicht angegeben: automatisch aus dem hellsten Stern im Cluster-Radius)
+    --aperture-per-star Passe Apertur/Annulus pro Stern individuell aus dem lokalen Sternprofil an
+  --fwhm FLOAT       FWHM für Quellenfindung (Standard: 3.0)
+  --threshold FLOAT  Schwelle in Sigma für Quellenfindung (Standard: 5.0)
+  --maxsep FLOAT     Max. Abstand beim Matching in Pixel (Standard: 5.0)
+  --filters B V      Labels der Filter (Standard: B V)
+  --save-cm FILE     Speicherpfad für das Color-Magnitude-Diagramm (relativ zum FITS-Ordner oder absolut)
+    --plot-stellar-profiles   Zeige Profil/PSF-Plot für einen hellen, mittleren und dunklen Stern
+    --save-stellar-profiles FILE  Speicherpfad für den Profil/PSF-Plot (relativ zum FITS-Ordner oder absolut)
+  --compare-cmd-methods  Vergleicht CMDs aus aperture- und psf-Auswertung in einem gemeinsamen Plot
+  --save-cmd-compare FILE  Speicherpfad für den CMD-Methodenvergleich (relativ zum FITS-Ordner oder absolut)
+  --compare-extraction-methods  Statistischer Vergleich der Helligkeitsextraktion (Apertur vs PSF) im
+                          V-Bild; Sterne werden im Bild nummeriert markiert (Nummer 1 = größte Abweichung)
+  --save-extraction-compare FILE  Speicherpfad für den Extraktionsmethoden-Vergleichsplot (relativ zum
+                          FITS-Ordner oder absolut)
+  --compare-aperture-radii R1 [R2 ...]  Extrahiere Helligkeiten mit beliebig vielen Apertur-Radien und
+                          vergleiche die Abweichung zur PSF-Helligkeit je Radius (Boxplot). Erfordert
+                          --compare-extraction-methods.
+  --save-aperture-radii-compare FILE  Speicherpfad für den Apertur-Radius-Vergleich (relativ zum
+                          FITS-Ordner oder absolut)
+  --cluster-radius FLOAT  Radius in Pixel um das Zentrum für Sternhaufen-Filterung (Standard: 40% der Bildhöhe, 0 = deaktiviert)
+  --cluster-center X Y    Zentrum (x, y) in Pixel für Sternhaufen-Filterung (Standard: Bildmitte)
+  --annulus-radii R_INNER R_OUTER  Nur Sterne in einem Ring (Annulus) zwischen innerem (R_INNER) und
+                          äußerem (R_OUTER) Radius in Pixel um das Zentrum berücksichtigen.
+                          Überschreibt --cluster-radius wenn angegeben.
+  --calibrate        Aktiviere interaktive Kalibrierung mit Referenzstern (klicken + Magnitudeneingabe)
+  --calibrate-file FILE   Pfad zur Kalibrierungsdatei (relativ zum FITS-Ordner oder absolut).
+                          Mit --calibrate: Speichern. Ohne --calibrate: Laden. Standard: calib.txt im FITS-Ordner.
+  --fit-isochrone    Bestimme Entfernung und Alter durch Isochronen-Anpassung (benötigt --calibrate)
+  --ebv FLOAT        Rötung E(B-V) in mag für Isochronen-Anpassung (wird interaktiv abgefragt falls nicht angegeben)
+  --age-range MIN MAX    Altersbereich als log(Alter/Jahre) (Standard: 6.5 8.5 = 3-300 Millionen Jahre)
+  --age FLOAT        Fixiertes Alter in Millionen Jahren (z.B. 10.6). Wenn gesetzt, wird nur die Entfernung bestimmt.
+
+Das Skript sucht nach Dateien mit Endungen .fits oder .fit und versucht, die erste 2D-Image-HDU
+anzuzeigen. Falls ein HDU 3D-Daten enthält, wird die erste Ebene verwendet.
+
+Alle Ausgabedateien (Plots, Kalibrierungsdaten) werden standardmäßig im selben Verzeichnis wie
+die FITS-Dateien gespeichert, außer es wird ein absoluter Pfad angegeben.
+
+Isochronen-Anpassung:
+  Das Programm lädt Isochrone von CMD 3.7 (http://stev.oapd.inaf.it) und bestimmt durch Chi²-Minimierung
+  das beste Alter und die Entfernung des Sternhaufens. Die Rötung E(B-V) muss bekannt sein.
+"""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import os
+import sys
+import urllib.request
+import urllib.parse
+from typing import List, Optional, Tuple
+
+import numpy as np
+import matplotlib.pyplot as plt
+from astropy.io import fits
+from astropy.visualization import ImageNormalize, ZScaleInterval
+
+# photutils wird für Photometrie verwendet (separates Paket, nicht Teil von astropy)
+try:
+    from photutils.detection import DAOStarFinder
+    from photutils.aperture import CircularAperture, CircularAnnulus, aperture_photometry
+    from astropy.stats import sigma_clipped_stats
+    # PSF-Photometrie Imports (optional)
+    try:
+        from photutils.psf import IterativePSFPhotometry
+        HAVE_PSF = True
+    except ImportError:
+        try:
+            from photutils.psf import PSFPhotometry
+            HAVE_PSF = True
+        except ImportError:
+            HAVE_PSF = False
+    HAVE_PHOTUTILS = True
+except ImportError as e:
+    HAVE_PHOTUTILS = False
+    HAVE_PSF = False
+    PHOTUTILS_ERROR = str(e)
+
+
+
+def find_fits_files(folder: str) -> List[str]:
+	"""Finde alle .fits oder .fit Dateien im Verzeichnis und gebe sie als sortierte Liste zurück."""
+	all_entries = os.listdir(folder)
+	fits_files = []
+	for entry in all_entries:
+		if entry.lower().endswith('.fits') or entry.lower().endswith('.fit'):
+			fits_files.append(os.path.join(folder, entry))
+	fits_files.sort()
+	return fits_files
+
+
+def get_output_path(fits_folder: str, filename: str) -> str:
+	"""Generiere Ausgabepfad im selben Verzeichnis wie die FITS-Dateien.
+	
+	Args:
+		fits_folder: Verzeichnis mit den FITS-Dateien
+		filename: Name der Ausgabedatei (z.B. 'calib.txt', 'cmd.png')
+	
+	Returns:
+		Vollständiger Pfad zur Ausgabedatei
+	"""
+	return os.path.join(fits_folder, filename)
+
+
+def _get_image_data_from_hdul(hdul) -> Optional[np.ndarray]:
+	"""Finde die erste HDU mit 2D-Image-Daten. Bei 3D: erste Scheibe zurückgeben."""
+	for h in hdul:
+		data = h.data
+		if data is None:
+			continue
+		arr = np.asarray(data)
+		if arr.ndim == 2:
+			return arr
+		if arr.ndim == 3 and arr.shape[0] > 0:
+			return arr[0]
+	return None
+
+
+def assign_filters_by_flux(tab1, tab2):
+    """Fallback: Bestimme Filter-Zuordnung basierend auf mittlerem Flux."""
+    mean_flux_1 = np.mean(tab1['aperture_sum_bkgsub']) if tab1 is not None else 0
+    mean_flux_2 = np.mean(tab2['aperture_sum_bkgsub']) if tab2 is not None else 0
+    
+    print(f"\nFlux-Analyse:")
+    print(f"  Bild 1: mittlerer Flux = {mean_flux_1:.1f}")
+    print(f"  Bild 2: mittlerer Flux = {mean_flux_2:.1f}")
+    
+    # V-Filter sollte typischerweise höheren Flux zeigen
+    if mean_flux_1 > mean_flux_2 * 1.1:
+        print("  → Bild 1 ist wahrscheinlich V (heller)")
+        print("  → Zuordnung: tabB = Bild 2, tabV = Bild 1")
+        return tab2, tab1  # (tabB, tabV)
+    elif mean_flux_2 > mean_flux_1 * 1.1:
+        print("  → Bild 2 ist wahrscheinlich V (heller)")
+        print("  → Zuordnung: tabB = Bild 1, tabV = Bild 2")
+        return tab1, tab2  # (tabB, tabV)
+    else:
+        print("  → Flüsse ähnlich, verwende Bild 1 = B, Bild 2 = V")
+        return tab1, tab2  # (tabB, tabV)
+
+
+def get_filter_from_header(header):
+    """Extrahiere Filter-Information aus FITS-Header.
+    
+    Sucht nach gängigen Header-Keywords für Filter.
+    Returns: Filter-Name (z.B. 'B', 'V') oder None
+    """
+    if header is None:
+        print("    DEBUG: Header ist None")
+        return None
+    
+    # Gängige FITS-Keywords für Filter (in Prioritätsreihenfolge)
+    filter_keywords = ['FILTER', 'FILTER1', 'FILTNAM', 'FILT', 'INSFILTE', 'HIERARCH ESO INS FILT1 NAME']
+    
+    print(f"    DEBUG: Durchsuche {len(header)} Header-Einträge nach Filter-Keywords...")
+    for keyword in filter_keywords:
+        if keyword in header:
+            filter_value = str(header[keyword]).strip().upper()
+            print(f"    DEBUG: Gefunden {keyword} = '{filter_value}'")
+            # Extrahiere nur den Buchstaben (z.B. "V" aus "V-Band" oder "SDSS-V")
+            if filter_value:
+                # Suche nach B, V, R, I, U, etc.
+                for char in filter_value:
+                    if char in 'BVRIUJHK':
+                        print(f"    DEBUG: Filter '{char}' extrahiert aus '{filter_value}'")
+                        return char
+                # Falls kein einzelner Buchstabe gefunden, gebe den ganzen String zurück
+                print(f"    DEBUG: Kein Standard-Filter gefunden, gebe '{filter_value}' zurück")
+                return filter_value
+    
+    print(f"    DEBUG: Kein Filter-Keyword gefunden. Zeige erste 20 Header-Einträge:")
+    for i, key in enumerate(sorted(header.keys())):
+        if i >= 20:
+            break
+        print(f"      {key} = {header[key]}")
+    
+    return None
+
+
+def load_fits_image(path: str) -> Tuple[Optional[np.ndarray], Optional[dict]]:
+	"""Öffne eine FITS-Datei und liefere (data, header) zurück. data kann None sein."""
+	try:
+		with fits.open(path, memmap=False) as hdul:
+			data = _get_image_data_from_hdul(hdul)
+			# Behalte den vollen Header als dict
+			header = dict(hdul[0].header) if len(hdul) > 0 and hdul[0].header is not None else None
+			return data, header
+	except Exception as e:
+		raise RuntimeError(f"Fehler beim Öffnen von {path}: {e}")
+
+
+def plot_images(images: List[Tuple[Optional[np.ndarray], Optional[dict]]], paths: List[str], 
+              phot_tables: Optional[List] = None, aperture_radius: Optional[float] = None,
+              cluster_radius: Optional[float] = None, cluster_center: Optional[Tuple[float, float]] = None,
+              image_offset: Optional[np.ndarray] = None,
+              matched_indices: Optional[List[Tuple[int, int]]] = None,
+              annulus_inner: Optional[float] = None,
+              save: Optional[str] = None) -> None:
+    """Zeige FITS-Bilder mit Aperturen und optionalem Cluster-Radius oder Annulus.
+    
+    Args:
+        image_offset: Offset [dx, dy] zwischen erstem und zweitem Bild (für Cluster-Kreis Verschiebung)
+        matched_indices: Liste von (index1, index2) Tupeln für gematchte Sterne
+        annulus_inner: Innerer Annulus-Radius in Pixel (wenn gesetzt, wird cluster_radius als äußerer Radius verwendet)
+    """
+    n = len(images)
+    if n == 0:
+        print("Keine Bilder zum Anzeigen.")
+        return
+    fig, axes = plt.subplots(1, n, figsize=(6 * n, 6))
+    if n == 1:
+        axes = [axes]
+
+    for i, (ax, (data, header), path) in enumerate(zip(axes, images, paths)):
+        ax.set_title(os.path.basename(path))
+        if data is None:
+            ax.text(0.5, 0.5, 'Keine 2D-Daten gefunden', ha='center', va='center')
+            ax.set_xticks([])
+            ax.set_yticks([])
+            continue
+        try:
+            norm = ImageNormalize(data, interval=ZScaleInterval())
+        except Exception:
+            norm = None
+        im = ax.imshow(data, cmap='gray', origin='lower', norm=norm)
+        ax.set_xlabel(f"Shape: {data.shape}")
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        
+        # Bestimme das Zentrum für dieses spezifische Bild
+        # Erstes Bild: Original-Zentrum
+        # Zweites Bild: Zentrum + Offset
+        current_center = cluster_center
+        if cluster_center is not None and i > 0 and image_offset is not None:
+            # Verschiebe das Zentrum für das zweite Bild
+            current_center = (cluster_center[0] + image_offset[0], 
+                            cluster_center[1] + image_offset[1])
+        
+        # Zeige Aperturen falls verfügbar
+        if phot_tables and i < len(phot_tables) and phot_tables[i] is not None:
+            tab = phot_tables[i]
+            
+            # Wenn matched_indices verfügbar ist, zeige NUR gematchte Sterne
+            if matched_indices is not None and len(matched_indices) > 0:
+                if i == 0:
+                    # Erstes Bild: zeige Sterne mit Indizes aus matched_indices[:,0]
+                    indices_to_show = [idx1 for idx1, idx2 in matched_indices]
+                else:
+                    # Zweites Bild: zeige Sterne mit Indizes aus matched_indices[:,1]
+                    indices_to_show = [idx2 for idx1, idx2 in matched_indices]
+                
+                coords = np.vstack((np.array(tab['x']), np.array(tab['y']))).T
+                coords_to_show = coords[indices_to_show]
+                positions = list(zip(coords_to_show[:, 0], coords_to_show[:, 1]))
+            else:
+                # Fallback: zeige alle Sterne (wie vorher)
+                coords = np.vstack((np.array(tab['x']), np.array(tab['y']))).T
+                
+                # Filtere nach Radius/Annulus falls angegeben (verwende aktuelles Zentrum)
+                if cluster_radius is not None and current_center is not None:
+                    dist = np.linalg.norm(coords - np.array(current_center), axis=1)
+                    if annulus_inner is not None:
+                        mask = (dist >= annulus_inner) & (dist <= cluster_radius)
+                    else:
+                        mask = dist <= cluster_radius
+                    coords_filtered = coords[mask]
+                    positions = list(zip(coords_filtered[:, 0], coords_filtered[:, 1]))
+                else:
+                    positions = list(zip(tab['x'], tab['y']))
+            
+            if hasattr(tab, 'colnames') and 'aperture_radius_used' in tab.colnames:
+                from matplotlib.patches import Circle
+                radii = np.asarray(tab['aperture_radius_used'], dtype=float)
+                if matched_indices is not None and len(matched_indices) > 0:
+                    radii_to_show = radii[indices_to_show]
+                elif cluster_radius is not None and current_center is not None:
+                    radii_to_show = radii[mask]
+                else:
+                    radii_to_show = radii
+
+                for (x_pos, y_pos), r in zip(positions, radii_to_show):
+                    c = Circle((x_pos, y_pos), float(r), fill=False, edgecolor='red', linewidth=1.0, alpha=0.7)
+                    ax.add_patch(c)
+            elif aperture_radius:
+                apertures = CircularAperture(positions, r=aperture_radius)
+                apertures.plot(color='red', lw=1.0, alpha=0.7, ax=ax)
+        
+        # Zeige Cluster-Radius-Kreis oder Annulus falls definiert (verwende aktuelles Zentrum)
+        if cluster_radius is not None and current_center is not None:
+            from matplotlib.patches import Circle
+            # Äußerer Kreis
+            circle = Circle(current_center, cluster_radius, fill=False, 
+                          edgecolor='cyan', linewidth=2, linestyle='--', alpha=0.8)
+            ax.add_patch(circle)
+            # Innerer Kreis (nur bei Annulus)
+            if annulus_inner is not None and annulus_inner > 0:
+                inner_circle = Circle(current_center, annulus_inner, fill=False,
+                                      edgecolor='cyan', linewidth=2, linestyle=':', alpha=0.8)
+                ax.add_patch(inner_circle)
+            # Markiere das Zentrum
+            ax.plot(current_center[0], current_center[1], 'c+', markersize=15, markeredgewidth=2)
+
+    plt.tight_layout()
+    if save:
+        try:
+            fig.savefig(save, dpi=150)
+            print(f"Abbildung gespeichert: {save}")
+        except Exception as e:
+            print(f"Fehler beim Speichern: {e}", file=sys.stderr)
+    plt.show()
+
+
+def _estimate_profile_radii_from_star(data: np.ndarray, x: float, y: float,
+                                      max_radius: float = 24.0) -> Optional[Tuple[float, float, float]]:
+    """Bestimme Apertur- und Annulus-Radien direkt aus einem Sternprofil.
+
+    Returns:
+        (r_aperture, r_annulus_inner, r_annulus_outer) oder None.
+    """
+    ny, nx = data.shape
+    rmax = max(3.0, float(max_radius))
+
+    x0 = int(round(x))
+    y0 = int(round(y))
+    xmin = max(0, x0 - int(np.ceil(rmax)))
+    xmax = min(nx, x0 + int(np.ceil(rmax)) + 1)
+    ymin = max(0, y0 - int(np.ceil(rmax)))
+    ymax = min(ny, y0 + int(np.ceil(rmax)) + 1)
+
+    cut = np.asarray(data[ymin:ymax, xmin:xmax], dtype=float)
+    if cut.size == 0:
+        return None
+
+    yy, xx = np.indices(cut.shape)
+    xx = xx + xmin
+    yy = yy + ymin
+    rr = np.sqrt((xx - x) ** 2 + (yy - y) ** 2)
+
+    bkg_mask = (rr >= 0.7 * rmax) & (rr <= rmax)
+    if np.any(bkg_mask):
+        bkg = np.median(cut[bkg_mask])
+    else:
+        bkg = np.median(cut)
+
+    signal = cut - bkg
+
+    # Rausch-Niveau aus äußerem Ring robust schätzen (MAD -> sigma).
+    if np.any(bkg_mask):
+        bkg_vals = cut[bkg_mask]
+        mad = np.median(np.abs(bkg_vals - np.median(bkg_vals)))
+        noise_sigma = 1.4826 * mad
+    else:
+        mad = np.median(np.abs(cut - np.median(cut)))
+        noise_sigma = 1.4826 * mad
+
+    if not np.isfinite(noise_sigma) or noise_sigma <= 0:
+        return None
+
+    bins = np.arange(0.0, rmax + 0.5001, 0.5)
+    centers = 0.5 * (bins[:-1] + bins[1:])
+    profile = []
+    for i in range(len(centers)):
+        mask = (rr >= bins[i]) & (rr < bins[i + 1])
+        if np.any(mask):
+            profile.append(np.median(signal[mask]))
+        else:
+            profile.append(np.nan)
+
+    profile = np.asarray(profile, dtype=float)
+    if np.sum(np.isfinite(profile)) < 2:
+        return None
+
+    # Optional glätten, um einzelne rauschbedingte Ausreißer zu unterdrücken.
+    smooth_profile = profile.copy()
+    for i in range(1, len(profile) - 1):
+        if np.isfinite(profile[i - 1]) and np.isfinite(profile[i]) and np.isfinite(profile[i + 1]):
+            smooth_profile[i] = np.median([profile[i - 1], profile[i], profile[i + 1]])
+
+    # Sternausdehnung bis in die Flügel: letzter Radius mit Signal > 0.4 sigma.
+    # Etwas strenger als zuvor, damit sehr große Aperturen bei hellen Sternen begrenzt bleiben.
+    wing_idx = np.where((np.isfinite(smooth_profile)) & (smooth_profile > 0.4 * noise_sigma))[0]
+    if len(wing_idx) > 0:
+        r_wing = centers[wing_idx[-1]] + 0.25
+    else:
+        # Falls die Flügelgrenze nicht robust ist, verwende konservativen Suchradius.
+        r_wing = max(3.0, 0.6 * rmax)
+
+    # Curve-of-growth: bestimme r_ap als Radius, der ~98.5% des eingeschlossenen Flusses erreicht.
+    # Das reduziert Flux-Verlust bei hellen Sternen mit breiten Fluegeln.
+    bin_flux = []
+    for i in range(len(centers)):
+        mask = (rr >= bins[i]) & (rr < bins[i + 1])
+        if np.any(mask):
+            # Negative Pixel nicht in die eingeschlossene Sternenergie zählen.
+            bin_flux.append(np.sum(np.clip(signal[mask], a_min=0.0, a_max=None)))
+        else:
+            bin_flux.append(0.0)
+
+    bin_flux = np.asarray(bin_flux, dtype=float)
+    if not np.any(np.isfinite(bin_flux)):
+        return None
+
+    cum_flux = np.cumsum(np.nan_to_num(bin_flux, nan=0.0))
+    wing_limit_idx = np.searchsorted(centers, r_wing, side='right') - 1
+    wing_limit_idx = int(np.clip(wing_limit_idx, 0, len(cum_flux) - 1))
+    total_flux = cum_flux[wing_limit_idx]
+    if not np.isfinite(total_flux) or total_flux <= 0:
+        return None
+
+    target_flux = 0.985 * total_flux
+    ap_candidates = np.where(cum_flux >= target_flux)[0]
+    if len(ap_candidates) == 0:
+        r_ap = r_wing
+    else:
+        r_ap = centers[ap_candidates[0]] + 0.25
+
+    if not np.isfinite(r_ap) or r_ap <= 0:
+        return None
+
+    # Annulus jenseits der Sternflügel starten, dann breit genug für robusten Hintergrund.
+    r_in = max(r_ap + 2.0, r_wing + 1.0)
+    r_out = r_in + max(6.0, 1.0 * r_ap)
+
+    return float(max(2.0, r_ap)), float(r_in), float(r_out)
+
+
+def _estimate_global_profile_radii(data: np.ndarray,
+                                   sources,
+                                   candidate_idx: np.ndarray,
+                                   fwhm: float) -> Optional[Tuple[float, float, float, int]]:
+    """Robuste globale Radius-Schätzung aus mehreren hellen Sternen.
+
+    Returns:
+        (r_ap, r_in, r_out, n_used) oder None.
+    """
+    if candidate_idx is None or len(candidate_idx) == 0:
+        return None
+
+    src_x = np.asarray(sources['x_centroid'], dtype=float)
+    src_y = np.asarray(sources['y_centroid'], dtype=float)
+
+    if 'flux' in sources.colnames:
+        brightness = np.asarray(sources['flux'], dtype=float)
+    elif 'peak' in sources.colnames:
+        brightness = np.asarray(sources['peak'], dtype=float)
+    else:
+        x_idx = np.clip(np.round(src_x).astype(int), 0, data.shape[1] - 1)
+        y_idx = np.clip(np.round(src_y).astype(int), 0, data.shape[0] - 1)
+        brightness = np.asarray(data[y_idx, x_idx], dtype=float)
+
+    cand = np.asarray(candidate_idx, dtype=int)
+    cand = cand[np.isfinite(brightness[cand]) & (brightness[cand] > 0)]
+    if len(cand) == 0:
+        return None
+
+    sort_idx = cand[np.argsort(brightness[cand])[::-1]]
+    pool = sort_idx[:min(30, len(sort_idx))]
+
+    # Vermeide extreme Top-Werte (oft Sättigung) wenn genügend Sterne vorhanden sind.
+    if len(pool) >= 10:
+        pool = pool[2:]
+
+    radii_ap = []
+    radii_in = []
+    radii_out = []
+    for idx in pool:
+        local = _estimate_profile_radii_from_star(
+            data,
+            float(src_x[idx]),
+            float(src_y[idx]),
+            max_radius=max(18.0, 10.0 * fwhm)
+        )
+        if local is None:
+            continue
+        r_ap, r_in, r_out = local
+        if r_out > r_in > r_ap > 0:
+            radii_ap.append(r_ap)
+            radii_in.append(r_in)
+            radii_out.append(r_out)
+
+    if len(radii_ap) == 0:
+        return None
+
+    r_ap_med = float(np.median(radii_ap))
+    r_in_med = float(np.median(radii_in))
+    r_out_med = float(np.median(radii_out))
+
+    # Stabilisiere gegen extreme Ausreißer und threshold-induzierte Sprünge.
+    # Obergrenze bewusst groesser, damit helle Sterne nicht zu klein beschnitten werden.
+    r_ap_med = float(np.clip(r_ap_med, 2.0 * fwhm, 10.0 * fwhm))
+    r_in_med = max(r_in_med, r_ap_med + 1.5)
+    r_out_med = max(r_out_med, r_in_med + 4.0)
+
+    return r_ap_med, r_in_med, r_out_med, len(radii_ap)
+
+
+def _radial_profile_from_star(data: np.ndarray, x: float, y: float,
+                              max_radius: float) -> Optional[Tuple[np.ndarray, np.ndarray, float]]:
+    """Berechne azimutal gemitteltes (radiales) Profil eines Sterns nach Hintergrundabzug."""
+    ny, nx = data.shape
+    rmax = max(4.0, float(max_radius))
+
+    x0 = int(round(x))
+    y0 = int(round(y))
+    half = int(np.ceil(rmax))
+    xmin = max(0, x0 - half)
+    xmax = min(nx, x0 + half + 1)
+    ymin = max(0, y0 - half)
+    ymax = min(ny, y0 + half + 1)
+
+    cut = np.asarray(data[ymin:ymax, xmin:xmax], dtype=float)
+    if cut.size == 0:
+        return None
+
+    yy, xx = np.indices(cut.shape)
+    xx = xx + xmin
+    yy = yy + ymin
+    rr = np.sqrt((xx - x) ** 2 + (yy - y) ** 2)
+
+    bkg_mask = (rr >= 0.7 * rmax) & (rr <= rmax)
+    if np.any(bkg_mask):
+        bkg = float(np.median(cut[bkg_mask]))
+    else:
+        bkg = float(np.median(cut))
+
+    signal = cut - bkg
+
+    bins = np.arange(0.0, rmax + 0.5001, 0.5)
+    centers = 0.5 * (bins[:-1] + bins[1:])
+    profile = []
+    for i in range(len(centers)):
+        mask = (rr >= bins[i]) & (rr < bins[i + 1])
+        if np.any(mask):
+            profile.append(float(np.median(signal[mask])))
+        else:
+            profile.append(np.nan)
+
+    return centers, np.asarray(profile, dtype=float), bkg
+
+
+def _fit_gaussian_psf_to_profile(r: np.ndarray, profile: np.ndarray,
+                                 fwhm_hint: float) -> Optional[Tuple[float, float, np.ndarray]]:
+    """Fitte ein einfaches 1D-Gauß-Profil an das radiale Sternprofil.
+
+    Model: I(r) = A * exp(-r^2/(2*sigma^2))
+    """
+    valid = np.isfinite(r) & np.isfinite(profile)
+    if np.sum(valid) < 5:
+        return None
+
+    r_fit = r[valid]
+    y_fit = profile[valid]
+
+    # Fokus auf den Kernbereich; negative Flügel dominieren sonst den Fit.
+    core_mask = (r_fit <= max(6.0, 2.5 * fwhm_hint)) & (y_fit > 0)
+    if np.sum(core_mask) < 4:
+        core_mask = y_fit > 0
+    if np.sum(core_mask) < 4:
+        return None
+
+    r_fit = r_fit[core_mask]
+    y_fit = y_fit[core_mask]
+
+    sigma_min = max(0.5, 0.25 * fwhm_hint)
+    sigma_max = max(6.0, 2.5 * fwhm_hint)
+    sigma_grid = np.linspace(sigma_min, sigma_max, 220)
+
+    best_sigma = None
+    best_amp = None
+    best_sse = np.inf
+
+    for sigma in sigma_grid:
+        basis = np.exp(-(r_fit ** 2) / (2.0 * sigma ** 2))
+        denom = float(np.dot(basis, basis))
+        if denom <= 0:
+            continue
+        amp = float(np.dot(y_fit, basis) / denom)
+        if amp <= 0:
+            continue
+        model = amp * basis
+        sse = float(np.sum((y_fit - model) ** 2))
+        if sse < best_sse:
+            best_sse = sse
+            best_sigma = sigma
+            best_amp = amp
+
+    if best_sigma is None or best_amp is None:
+        return None
+
+    model_full = best_amp * np.exp(-(r ** 2) / (2.0 * best_sigma ** 2))
+    fwhm_fit = 2.354820045 * best_sigma
+    return best_amp, fwhm_fit, model_full
+
+
+def plot_star_profile_psf_samples(data: np.ndarray, phot_table, fwhm: float,
+                                  save: Optional[str] = None) -> None:
+    """Zeige Profile für einen hellen, mittleren und dunklen Stern inkl. PSF-Fit."""
+    if data is None or phot_table is None or len(phot_table) < 3:
+        print("Zu wenige Sterne für Profil/PSF-Plot.")
+        return
+
+    if 'aperture_sum_bkgsub' in phot_table.colnames:
+        flux = np.asarray(phot_table['aperture_sum_bkgsub'], dtype=float)
+    elif 'flux' in phot_table.colnames:
+        flux = np.asarray(phot_table['flux'], dtype=float)
+    elif 'peak' in phot_table.colnames:
+        flux = np.asarray(phot_table['peak'], dtype=float)
+    else:
+        x_idx = np.clip(np.round(np.asarray(phot_table['x'], dtype=float)).astype(int), 0, data.shape[1] - 1)
+        y_idx = np.clip(np.round(np.asarray(phot_table['y'], dtype=float)).astype(int), 0, data.shape[0] - 1)
+        flux = np.asarray(data[y_idx, x_idx], dtype=float)
+
+    finite = np.where(np.isfinite(flux))[0]
+    if len(finite) < 3:
+        print("Zu wenige gültige Flüsse für Profil/PSF-Plot.")
+        return
+
+    flux_valid = flux[finite]
+    sort_local = np.argsort(flux_valid)
+    idx_dark = finite[sort_local[max(0, int(0.2 * (len(sort_local) - 1)))]]
+    idx_mid = finite[sort_local[max(0, int(0.5 * (len(sort_local) - 1)))]]
+    idx_bright = finite[sort_local[-1]]
+
+    sample_indices = [idx_bright, idx_mid, idx_dark]
+    sample_names = ['Heller Stern', 'Mittel heller Stern', 'Dunkler Stern']
+
+    fig, axes = plt.subplots(1, 3, figsize=(16, 4.8), sharey=False)
+    rmax = max(10.0, 8.0 * fwhm)
+    plotted_any = False
+
+    for ax, idx, name in zip(axes, sample_indices, sample_names):
+        x = float(phot_table['x'][idx])
+        y = float(phot_table['y'][idx])
+        prof = _radial_profile_from_star(data, x, y, max_radius=rmax)
+        if prof is None:
+            ax.set_title(f"{name}\nkein Profil")
+            ax.grid(alpha=0.3)
+            continue
+
+        r, y_prof, bkg = prof
+        fit = _fit_gaussian_psf_to_profile(r, y_prof, fwhm_hint=fwhm)
+
+        if fit is not None:
+            amp, fwhm_fit, model = fit
+            peak_value = float(np.nanmax(model)) if np.any(np.isfinite(model)) else float(np.nanmax(y_prof))
+            half_level = 0.5 * peak_value
+
+            mirrored_r = np.concatenate((-r[::-1], r))
+            mirrored_y = np.concatenate((y_prof[::-1], y_prof))
+            mirrored_model = np.concatenate((model[::-1], model))
+
+            ax.plot(mirrored_r, mirrored_y, 'o', ms=3.8, alpha=0.8, label='Azimutal gemitteltes Profil')
+            ax.plot(mirrored_r, mirrored_model, '-', lw=2.0, label=f'Gauß-PSF-Fit (FWHM={fwhm_fit:.2f}px)')
+
+            half_max_y = half_level
+            fwhm_half = 0.5 * fwhm_fit
+            x_span_left = -fwhm_half
+            x_span_right = fwhm_half
+
+            ax.axhline(half_level, color='tab:red', ls='--', lw=1.2, alpha=0.8, label='Half-max')
+            ax.plot([x_span_left, x_span_right], [half_level, half_level], color='tab:red', lw=2.0, alpha=0.9)
+            ax.vlines([x_span_left, x_span_right], ymin=0.0, ymax=half_level, colors='tab:red', linestyles='--', lw=1.2)
+            ax.annotate(f'FWHM={fwhm_fit:.2f}px', xy=(0.0, half_level), xytext=(0.02, 0.94),
+                        textcoords='axes fraction', color='tab:red', fontsize=8,
+                        bbox=dict(boxstyle='round', facecolor='white', alpha=0.8, edgecolor='tab:red'))
+            ax.text(0.03, 0.80, f"A={amp:.1f}\nBkg={bkg:.1f}", transform=ax.transAxes,
+                    va='top', ha='left', fontsize=8,
+                    bbox=dict(boxstyle='round', facecolor='white', alpha=0.85, edgecolor='0.7'))
+        else:
+            mirrored_r = np.concatenate((-r[::-1], r))
+            mirrored_y = np.concatenate((y_prof[::-1], y_prof))
+            ax.plot(mirrored_r, mirrored_y, 'o', ms=3.8, alpha=0.8, label='Azimutal gemitteltes Profil')
+            ax.text(0.03, 0.97, f"Kein stabiler PSF-Fit\nBkg={bkg:.1f}", transform=ax.transAxes,
+                    va='top', ha='left', fontsize=8,
+                    bbox=dict(boxstyle='round', facecolor='white', alpha=0.85, edgecolor='0.7'))
+
+        ax.set_title(f"{name}\n(x={x:.1f}, y={y:.1f})")
+        ax.set_xlabel('Radius [Pixel]')
+        ax.set_ylabel('Signal über Hintergrund [ADU]')
+        ax.axvline(0, color='gray', lw=0.9, alpha=0.6)
+        x_limit = max(rmax, 3.5 * fwhm if fit is not None else rmax)
+        ax.set_xlim(-x_limit, x_limit)
+
+        # Eigene y-Skalierung pro Panel, damit mittlere/schwache Sterne sichtbar bleiben.
+        y_vals = np.concatenate((y_prof[::-1], y_prof)) if np.isfinite(y_prof).any() else np.array([])
+        if fit is not None:
+            y_model = np.concatenate((model[::-1], model)) if np.isfinite(model).any() else np.array([])
+            y_vals = np.concatenate([y_vals, y_model]) if y_model.size > 0 and y_vals.size > 0 else y_vals if y_vals.size > 0 else y_model
+        if y_vals.size > 0:
+            y_vals = y_vals[np.isfinite(y_vals)]
+            if y_vals.size > 0:
+                y_lo = float(np.nanpercentile(y_vals, 2))
+                y_hi = float(np.nanpercentile(y_vals, 99))
+                if not np.isfinite(y_lo) or not np.isfinite(y_hi) or y_hi <= y_lo:
+                    y_lo = float(np.nanmin(y_vals))
+                    y_hi = float(np.nanmax(y_vals))
+                if np.isfinite(y_lo) and np.isfinite(y_hi) and y_hi > y_lo:
+                    pad = 0.10 * (y_hi - y_lo)
+                    if y_hi > 0 and y_lo >= 0:
+                        y_lo = -0.05 * y_hi
+                    ax.set_ylim(y_lo - pad, y_hi + pad)
+
+        ax.grid(alpha=0.3)
+        ax.legend(fontsize=8, loc='upper right')
+        plotted_any = True
+
+    axes[0].set_ylabel('Signal über Hintergrund [ADU]')
+    fig.suptitle('Azimutal gemittelte 2D-Sternprofile mit angepasster PSF', fontsize=13)
+    plt.tight_layout()
+    if save:
+        try:
+            fig.savefig(save, dpi=150)
+            print(f"Sternprofil/PSF-Plot gespeichert: {save}")
+        except Exception as e:
+            print(f"Fehler beim Speichern des Sternprofil/PSF-Plots: {e}", file=sys.stderr)
+    if plotted_any:
+        plt.show()
+    else:
+        plt.close(fig)
+
+
+def detect_and_photometry(data: np.ndarray, fwhm: float = 3.0, threshold_sigma: float = 5.0,
+                          aperture_radius: float = None,
+                          cluster_center: Optional[Tuple[float, float]] = None,
+                          cluster_radius: Optional[float] = None,
+                          aperture_per_star: bool = False,
+                          detect_fwhm_scale: float = 0.85):
+    """Erkenne Quellen mit DAOStarFinder und führe Aperturphotometrie mit Hintergrundsubtraktion aus.
+
+    Liefert (phot_table, aperture_radius):
+    - phot_table: Tabelle mit x, y, aperture_sum (Roh-Flux), sky_median (Himmelshintergrund pro Pixel),
+                  und aperture_sum_bkgsub (hintergrundkorrigierter Flux).
+    - aperture_radius: Der tatsächlich verwendete Aperturradius (wichtig wenn automatisch berechnet)
+    
+    Die Hintergrundsubtraktion erfolgt mittels Sky-Annulus (Kreisring um jede Quelle).
+    
+    Parameters:
+        aperture_radius: Wenn None, wird automatisch robust aus mehreren hellen Sternen geschätzt.
+        cluster_center: Zentrum der Cluster-Selektion (x, y) für die Radius-Schätzung.
+        cluster_radius: Radius der Cluster-Selektion für die Radius-Schätzung.
+        aperture_per_star: Falls True, werden Apertur/Annulus pro Stern individuell gesetzt.
+    
+    Returns:
+        (phot_table, aperture_radius): Tuple aus Photometrie-Tabelle und verwendetem Aperturradius
+    """
+    if not HAVE_PHOTUTILS:
+        msg = (
+            "Das Paket 'photutils' ist nicht installiert. Bitte installieren Sie es mit:\n"
+            "pip install photutils\n"
+            f"Original Fehler: {PHOTUTILS_ERROR}"
+        )
+        raise RuntimeError(msg)
+    
+    # Robust stats für Quellenfindung
+    mean, median, std = sigma_clipped_stats(data, sigma=3.0)
+    threshold = median + threshold_sigma * std
+
+    finder_fwhm = max(1.2, float(fwhm) * float(detect_fwhm_scale))
+    daofind = DAOStarFinder(fwhm=finder_fwhm, threshold=threshold)
+    sources = daofind(data - median)
+    if sources is None or len(sources) == 0:
+        return None
+
+    auto_aperture_requested = aperture_radius is None
+
+    if aperture_radius is None:
+        src_x = np.asarray(sources['x_centroid'], dtype=float)
+        src_y = np.asarray(sources['y_centroid'], dtype=float)
+
+        if cluster_center is not None and cluster_radius is not None and cluster_radius > 0:
+            dist = np.sqrt((src_x - cluster_center[0]) ** 2 + (src_y - cluster_center[1]) ** 2)
+            candidate_mask = dist <= cluster_radius
+        else:
+            candidate_mask = np.ones(len(sources), dtype=bool)
+
+        candidate_idx = np.where(candidate_mask)[0]
+        if len(candidate_idx) == 0:
+            candidate_idx = np.arange(len(sources))
+
+        profile_radii = _estimate_global_profile_radii(data, sources, candidate_idx, fwhm)
+        profile_annulus_inner = None
+        profile_annulus_outer = None
+        if profile_radii is not None:
+            aperture_radius, profile_annulus_inner, profile_annulus_outer, n_used = profile_radii
+
+        if profile_radii is not None and np.isfinite(aperture_radius) and aperture_radius > 0:
+            print(f"  Automatische Apertur: robuste Profil-Schätzung aus {n_used} hellen Sternen")
+            print(f"    Apertur-Radius = {aperture_radius:.2f} Pixel")
+            print(f"    Annulus direkt aus Sternprofil: r_in={profile_annulus_inner:.2f}, r_out={profile_annulus_outer:.2f} Pixel")
+        else:
+            aperture_radius = 3.0 * fwhm
+            profile_annulus_inner = None
+            profile_annulus_outer = None
+            print("  Warnung: Sternprofil konnte nicht robust ausgewertet werden. Fallback auf 3.0×FWHM.")
+            print(f"    Apertur-Radius = {aperture_radius:.2f} Pixel")
+    else:
+        profile_annulus_inner = None
+        profile_annulus_outer = None
+        print(f"  Manuelle Apertur: radius = {aperture_radius:.1f} Pixel")
+
+    # Verwende Zentren der Quellen für Aperturphotometrie
+    positions = list(zip(sources['x_centroid'], sources['y_centroid']))
+
+    # Optional: adaptive Aperturen pro Stern basierend auf jeweiligem Sternprofil.
+    # WICHTIG: Auch mit gesetztem --aperture aktiv. Dann dient --aperture als Basisradius.
+    if aperture_per_star:
+        n_sources = len(positions)
+        per_aperture = np.full(n_sources, aperture_radius, dtype=float)
+        if profile_annulus_inner is not None and profile_annulus_outer is not None:
+            per_r_in = np.full(n_sources, profile_annulus_inner, dtype=float)
+            per_r_out = np.full(n_sources, profile_annulus_outer, dtype=float)
+        else:
+            per_r_in = np.full(n_sources, aperture_radius * 1.5, dtype=float)
+            per_r_out = np.full(n_sources, aperture_radius * 2.5, dtype=float)
+
+        # Helligkeits-Skalierung als robustes Fallback, falls lokales Profil nicht stabil ist.
+        if 'flux' in sources.colnames:
+            brightness = np.asarray(sources['flux'], dtype=float)
+        elif 'peak' in sources.colnames:
+            brightness = np.asarray(sources['peak'], dtype=float)
+        else:
+            x_idx = np.clip(np.round(np.asarray(sources['x_centroid'], dtype=float)).astype(int), 0, data.shape[1] - 1)
+            y_idx = np.clip(np.round(np.asarray(sources['y_centroid'], dtype=float)).astype(int), 0, data.shape[0] - 1)
+            brightness = np.asarray(data[y_idx, x_idx], dtype=float)
+
+        finite_brightness = brightness[np.isfinite(brightness) & (brightness > 0)]
+        if finite_brightness.size > 0:
+            brightness_ref = float(np.percentile(finite_brightness, 90))
+        else:
+            brightness_ref = 1.0
+
+        adaptive_ok = 0
+        fallback_scaled = 0
+        for idx, (x, y) in enumerate(positions):
+            local_radii = _estimate_profile_radii_from_star(data, float(x), float(y), max_radius=max(18.0, 10.0 * fwhm))
+            if local_radii is None:
+                # Fallback: Radius ueber Helligkeit skalieren (helle Sterne groesser).
+                b = brightness[idx] if np.isfinite(brightness[idx]) else brightness_ref
+                ratio = max(1e-6, float(b) / max(1e-6, brightness_ref))
+                scale = np.clip(ratio ** 0.28, 0.65, 2.00)
+                per_aperture[idx] = max(2.0, aperture_radius * scale)
+                per_r_in[idx] = per_aperture[idx] + 2.0
+                per_r_out[idx] = per_r_in[idx] + max(6.0, per_aperture[idx])
+                fallback_scaled += 1
+                continue
+            r_ap_local, r_in_local, r_out_local = local_radii
+            if np.isfinite(r_ap_local) and np.isfinite(r_in_local) and np.isfinite(r_out_local) and r_out_local > r_in_local > r_ap_local > 0:
+                # Leichte Helligkeits-Gewichtung, damit helle Sterne sichtbar groessere Aperturen haben.
+                b = brightness[idx] if np.isfinite(brightness[idx]) else brightness_ref
+                ratio = max(1e-6, float(b) / max(1e-6, brightness_ref))
+                scale = np.clip(ratio ** 0.17, 0.78, 1.70)
+                per_aperture[idx] = max(2.0, r_ap_local * scale)
+                per_r_in[idx] = max(per_aperture[idx] + 1.5, r_in_local * scale)
+                per_r_out[idx] = max(per_r_in[idx] + 4.0, r_out_local * scale)
+                adaptive_ok += 1
+
+        print(
+            f"  Adaptive Apertur pro Stern: {adaptive_ok}/{n_sources} aus Profil, "
+            f"{fallback_scaled}/{n_sources} ueber Helligkeits-Fallback skaliert"
+        )
+        print(
+            f"    Verwendete Apertur-Radien: min={np.min(per_aperture):.2f}, "
+            f"median={np.median(per_aperture):.2f}, max={np.max(per_aperture):.2f} Pixel"
+        )
+
+        aperture_sum = np.zeros(n_sources, dtype=float)
+        bkg_median = np.zeros(n_sources, dtype=float)
+
+        for idx, (x, y) in enumerate(positions):
+            r_ap = float(per_aperture[idx])
+            r_in = float(per_r_in[idx])
+            r_out = float(per_r_out[idx])
+
+            ap = CircularAperture([(x, y)], r=r_ap)
+            ap_tab = aperture_photometry(data, ap)
+            aperture_sum[idx] = float(ap_tab['aperture_sum'][0])
+
+            ann = CircularAnnulus([(x, y)], r_in=r_in, r_out=r_out)
+            ann_mask = ann.to_mask(method='center')[0]
+            ann_data = ann_mask.multiply(data)
+            ann_data_1d = ann_data[ann_mask.data > 0]
+            if ann_data_1d.size > 0:
+                _, median_val, _ = sigma_clipped_stats(ann_data_1d, sigma=3.0)
+                bkg_median[idx] = median_val
+            else:
+                bkg_median[idx] = median
+
+        aperture_area = np.pi * per_aperture**2
+        total_bkg = bkg_median * aperture_area
+        aperture_sum_bkgsub = aperture_sum - total_bkg
+
+        phot_table = sources.copy()
+        phot_table['aperture_sum'] = aperture_sum
+        phot_table['x'] = sources['x_centroid']
+        phot_table['y'] = sources['y_centroid']
+        phot_table['sky_median'] = bkg_median
+        phot_table['aperture_sum_bkgsub'] = aperture_sum_bkgsub
+        phot_table['aperture_radius_used'] = per_aperture
+        phot_table['annulus_r_in_used'] = per_r_in
+        phot_table['annulus_r_out_used'] = per_r_out
+
+        aperture_repr = float(np.median(per_aperture))
+        return phot_table, aperture_repr
+    
+    # Signal-Apertur
+    apertures = CircularAperture(positions, r=aperture_radius)
+    phot_table = aperture_photometry(data, apertures)
+    
+    # Hintergrund-Annulus: bevorzugt direkt aus Profil des hellsten Sterns, sonst Fallback.
+    if profile_annulus_inner is not None and profile_annulus_outer is not None:
+        r_in = profile_annulus_inner
+        r_out = profile_annulus_outer
+    else:
+        r_in = aperture_radius * 1.5
+        r_out = aperture_radius * 2.5
+    annulus_apertures = CircularAnnulus(positions, r_in=r_in, r_out=r_out)
+    annulus_masks = annulus_apertures.to_mask(method='center')
+    
+    # Berechne den Median des Himmels in jedem Annulus
+    bkg_median = []
+    for mask in annulus_masks:
+        annulus_data = mask.multiply(data)
+        annulus_data_1d = annulus_data[mask.data > 0]
+        # Verwende sigma-clipping für robuste Statistik
+        _, median_val, _ = sigma_clipped_stats(annulus_data_1d, sigma=3.0)
+        bkg_median.append(median_val)
+    
+    bkg_median = np.array(bkg_median)
+    
+    # Berechne die Gesamthintergrundkontamination in der Signal-Apertur
+    # Fläche der Apertur = pi * r^2
+    aperture_area = np.pi * aperture_radius**2
+    total_bkg = bkg_median * aperture_area
+    
+    # Hintergrundkorrigierter Flux
+    aperture_sum_bkgsub = phot_table['aperture_sum'] - total_bkg
+    
+    # Füge alle Informationen zur Tabelle hinzu
+    phot_table['x'] = sources['x_centroid']
+    phot_table['y'] = sources['y_centroid']
+    phot_table['sky_median'] = bkg_median
+    phot_table['aperture_sum_bkgsub'] = aperture_sum_bkgsub
+    
+    return phot_table, aperture_radius  # Gebe auch den verwendeten Radius zurück!
+
+
+def detect_and_psf_photometry(data: np.ndarray, fwhm: float = 3.0, threshold_sigma: float = 5.0,
+                              aperture_radius: float = None, detect_fwhm_scale: float = 0.85):
+    """Erkenne Quellen mit DAOStarFinder und führe PSF-Photometrie durch.
+    
+    PSF-Photometrie ist besser geeignet für dichte Sternfelder, da sie einzelne Sterne
+    auch bei Überlappungen separieren kann.
+    
+    Liefert (phot_table, aperture_radius):
+    - phot_table: Tabelle mit x, y, flux_fit (PSF-angepasster Flux)
+    - aperture_radius: Der verwendete Aperturradius (für Kompatibilität mit Aperturphotometrie)
+    
+    Parameters:
+        aperture_radius: Wenn None, wird automatisch 3.0×FWHM verwendet.
+    
+    Returns:
+        (phot_table, aperture_radius): Tuple aus Photometrie-Tabelle und verwendetem Aperturradius
+    """
+    if not HAVE_PHOTUTILS:
+        msg = (
+            "Das Paket 'photutils' ist nicht installiert. Bitte installieren Sie es mit:\n"
+            "pip install photutils\n"
+            f"Original Fehler: {PHOTUTILS_ERROR}"
+        )
+        raise RuntimeError(msg)
+    
+    if not HAVE_PSF:
+        print("  Warnung: PSF-Photometrie nicht verfügbar. Fallback auf Aperturphotometrie...")
+        return detect_and_photometry(data, fwhm=fwhm, threshold_sigma=threshold_sigma, 
+                                    aperture_radius=aperture_radius)
+    
+    # Automatische Apertur-Berechnung basierend auf FWHM
+    if aperture_radius is None:
+        aperture_radius = 3.0 * fwhm
+        print(f"  Automatische Apertur: radius = 3.0 × FWHM = 3.0 × {fwhm:.1f} = {aperture_radius:.1f} Pixel")
+    else:
+        print(f"  Manuelle Apertur: radius = {aperture_radius:.1f} Pixel")
+    
+    # Robust stats für Quellenfindung
+    mean, median, std = sigma_clipped_stats(data, sigma=3.0)
+    threshold = median + threshold_sigma * std
+    
+    finder_fwhm = max(1.2, float(fwhm) * float(detect_fwhm_scale))
+    daofind = DAOStarFinder(fwhm=finder_fwhm, threshold=threshold)
+    sources = daofind(data - median)
+    if sources is None or len(sources) == 0:
+        return None
+    
+    print(f"  PSF-Photometrie: Gefundene {len(sources)} Quellen, wende iterative PSF-Anpassung an...")
+    
+    try:
+        from photutils.psf import IterativePSFPhotometry, GaussianPSF
+        
+        # Erstelle ein einfaches Gauss-PSF-Modell mit bekanntem FWHM
+        psf_model = GaussianPSF(x_fwhm=fwhm, y_fwhm=fwhm)
+        
+        # Definiere die Größe der Anpassungsregion um jeden Stern
+        fit_shape = (int(2*aperture_radius+1), int(2*aperture_radius+1))
+        
+        # Erstelle das PSF-Photometrie-Objekt
+        photometry = IterativePSFPhotometry(
+            psf_model=psf_model,
+            fit_shape=fit_shape,
+            finder=daofind,
+            aperture_radius=aperture_radius,
+            maxiters=3  # 3 Iterationen für iterative Subtraktion
+        )
+        
+        # Führe PSF-Photometrie durch
+        phot_table = photometry(data - median)
+        
+        if phot_table is None or len(phot_table) == 0:
+            print("  Warnung: PSF-Photometrie lieferte keine Ergebnisse. Fallback auf Aperturphotometrie...")
+            return detect_and_photometry(data, fwhm=fwhm, threshold_sigma=threshold_sigma, 
+                                        aperture_radius=aperture_radius)
+        
+        # Stelle sicher, dass alle notwendigen Spalten existieren
+        if 'x_fit' in phot_table.colnames:
+            phot_table['x'] = phot_table['x_fit']
+        else:
+            phot_table['x'] = sources['x_centroid']
+            
+        if 'y_fit' in phot_table.colnames:
+            phot_table['y'] = phot_table['y_fit']
+        else:
+            phot_table['y'] = sources['y_centroid']
+        
+        # Benenne Flux-Spalte um zur Kompatibilität
+        if 'flux_fit' in phot_table.colnames:
+            phot_table['aperture_sum_bkgsub'] = phot_table['flux_fit']
+        elif 'flux' in phot_table.colnames:
+            phot_table['aperture_sum_bkgsub'] = phot_table['flux']
+        else:
+            # Fallback: verwende die erste Flux-ähnliche Spalte
+            for col in phot_table.colnames:
+                if 'flux' in col.lower():
+                    phot_table['aperture_sum_bkgsub'] = phot_table[col]
+                    break
+            else:
+                # Wenn nichts gefunden, Aperturphotometrie als Fallback
+                print("  Warnung: Keine Flux-Spalte in PSF-Ergebnissen. Fallback auf Aperturphotometrie...")
+                return detect_and_photometry(data, fwhm=fwhm, threshold_sigma=threshold_sigma, 
+                                            aperture_radius=aperture_radius)
+        
+        # Füge Himmelshintergrund hinzu (für Konsistenz)
+        phot_table['sky_median'] = np.full(len(phot_table), median)
+        
+        print(f"  PSF-Photometrie erfolgreich: {len(phot_table)} Sterne angepasst")
+        return phot_table, aperture_radius
+        
+    except Exception as e:
+        print(f"  Warnung: PSF-Photometrie fehlgeschlagen ({type(e).__name__}: {e}). Fallback auf Aperturphotometrie...")
+        # Fallback auf Aperturphotometrie
+        positions = list(zip(sources['x_centroid'], sources['y_centroid']))
+        apertures = CircularAperture(positions, r=aperture_radius)
+        phot_table = aperture_photometry(data, apertures)
+        
+        # Hintergrund-Annulus
+        r_in = aperture_radius * 1.5
+        r_out = aperture_radius * 2.5
+        annulus_apertures = CircularAnnulus(positions, r_in=r_in, r_out=r_out)
+        annulus_masks = annulus_apertures.to_mask(method='center')
+        
+        bkg_median = []
+        for mask in annulus_masks:
+            annulus_data = mask.multiply(data)
+            annulus_data_1d = annulus_data[mask.data > 0]
+            _, median_val, _ = sigma_clipped_stats(annulus_data_1d, sigma=3.0)
+            bkg_median.append(median_val)
+        
+        bkg_median = np.array(bkg_median)
+        aperture_area = np.pi * aperture_radius**2
+        total_bkg = bkg_median * aperture_area
+        aperture_sum_bkgsub = phot_table['aperture_sum'] - total_bkg
+        
+        phot_table['x'] = sources['x_centroid']
+        phot_table['y'] = sources['y_centroid']
+        phot_table['sky_median'] = bkg_median
+        phot_table['aperture_sum_bkgsub'] = aperture_sum_bkgsub
+        
+        return phot_table, aperture_radius
+
+
+def detect_and_photometry_wrapper(data: np.ndarray, method: str = 'aperture', fwhm: float = 3.0, 
+                                   threshold_sigma: float = 5.0, aperture_radius: float = None,
+                                   cluster_center: Optional[Tuple[float, float]] = None,
+                                   cluster_radius: Optional[float] = None,
+                                   aperture_per_star: bool = False,
+                                   detect_fwhm_scale: float = 0.85):
+    """Wrapper-Funktion, die zwischen Apertur- und PSF-Photometrie wählt.
+    
+    Parameters:
+        data: 2D-Array mit Bilddaten
+        method: 'aperture' oder 'psf'
+        fwhm: FWHM in Pixel für Quellenfindung
+        threshold_sigma: Schwelle in Sigma
+        aperture_radius: Aperturradius (auto-berechnet falls None)
+        cluster_center: Zentrum fuer Cluster-Selektion fuer Auto-Apertur
+        cluster_radius: Radius fuer Cluster-Selektion fuer Auto-Apertur
+        aperture_per_star: Falls True, pro Stern individuelle Apertur/Annulus-Radien
+    
+    Returns:
+        (phot_table, aperture_radius): Photometrie-Ergebnisse
+    """
+    if method == 'psf':
+        return detect_and_psf_photometry(data, fwhm=fwhm, threshold_sigma=threshold_sigma, 
+                                         aperture_radius=aperture_radius,
+                                         detect_fwhm_scale=detect_fwhm_scale)
+    else:  # default: 'aperture'
+        return detect_and_photometry(data, fwhm=fwhm, threshold_sigma=threshold_sigma, 
+                                     aperture_radius=aperture_radius,
+                                     cluster_center=cluster_center,
+                                     cluster_radius=cluster_radius,
+                                     aperture_per_star=aperture_per_star,
+                                     detect_fwhm_scale=detect_fwhm_scale)
+
+
+def estimate_transform(coords1, coords2, matches):
+    """Schätze Translations-Offset zwischen zwei Koordinatensätzen basierend auf Matches."""
+    if len(matches) == 0:
+        return None
+    
+    offsets = []
+    for i1, i2 in matches:
+        offset = coords2[i2] - coords1[i1]
+        offsets.append(offset)
+    
+    # Robuste Schätzung: Median-Offset
+    median_offset = np.median(offsets, axis=0)
+    return median_offset
+
+
+def match_sources(tab1, tab2, max_sep: float = 5.0, search_radius: float = 100.0, 
+                  filter_radius: Optional[float] = None, center: Optional[Tuple[float, float]] = None,
+                  annulus_inner: Optional[float] = None):
+    """Match sources in tab1 to tab2 using robust iterative pattern matching.
+    
+    Diese Methode ist robust gegenüber Verschiebungen zwischen den Bildern.
+    Sie verwendet RANSAC-artiges iteratives Matching um die Transformation zu finden.
+    
+    WICHTIG: Die Radius-/Annulus-Filterung erfolgt NUR auf Basis von tab1 (B-Filter).
+    Alle Matches werden dann nur für Sterne innerhalb dieses Bereichs in tab1 erstellt.
+    
+    Args:
+        tab1, tab2: Photometry tables with 'x' and 'y' columns
+        max_sep: Maximum separation for final matching (pixels)
+        search_radius: Initial search radius for finding transformation (pixels)
+        filter_radius: Optional outer radius - only sources within this radius from center in tab1
+        center: Optional center point (x, y) for radius filter in tab1 (B-Filter) coordinates
+        annulus_inner: Optional inner radius for annulus filter. When set, only sources between
+                       annulus_inner and filter_radius are used.
+    
+    Rückgabe: (matched_pairs, offset) - Liste von Tupeln (index1, index2) und Offset [dx, dy]
+    """
+    if tab1 is None or tab2 is None:
+        return [], None
+    
+    coords1 = np.vstack((np.array(tab1['x']), np.array(tab1['y']))).T
+    coords2 = np.vstack((np.array(tab2['x']), np.array(tab2['y']))).T
+    
+    # Bestimme welche Sterne in tab1 (B-Filter) im Annulus oder Kreis liegen
+    indices1_in_radius = None
+    if filter_radius is not None and center is not None:
+        dist1 = np.linalg.norm(coords1 - np.array(center), axis=1)
+        if annulus_inner is not None:
+            # Annulus-Filter: nur Sterne zwischen r_inner und r_outer (=filter_radius)
+            mask1 = (dist1 >= annulus_inner) & (dist1 <= filter_radius)
+            indices1_in_radius = set(np.where(mask1)[0])
+            print(f"Annulus-Filter (B-Filter): {len(indices1_in_radius)}/{len(coords1)} Quellen im Ring "
+                  f"({annulus_inner:.1f} – {filter_radius:.1f} Pixel) um ({center[0]:.1f}, {center[1]:.1f})")
+        else:
+            mask1 = dist1 <= filter_radius
+            indices1_in_radius = set(np.where(mask1)[0])
+            print(f"Radius-Filter (B-Filter): {len(indices1_in_radius)}/{len(coords1)} Quellen innerhalb von {filter_radius:.1f} Pixel vom Zentrum ({center[0]:.1f}, {center[1]:.1f})")
+        
+        if len(indices1_in_radius) < 3:
+            print("Zu wenige Quellen im B-Filter nach Radius-/Annulus-Filterung (< 3).")
+            return [], None
+    
+    if len(coords1) < 3 or len(coords2) < 3:
+        print("Zu wenige Quellen für robustes Matching (< 3 in einem Bild).")
+        return [], None
+    
+    # Sortiere nach Helligkeit für RANSAC (verwende alle Sterne für Offset-Bestimmung)
+    if 'aperture_sum_bkgsub' in tab1.colnames:
+        flux1 = np.array(tab1['aperture_sum_bkgsub'])
+        flux2 = np.array(tab2['aperture_sum_bkgsub'])
+        sort1 = np.argsort(flux1)[::-1]
+        sort2 = np.argsort(flux2)[::-1]
+        coords1_bright = coords1[sort1]
+        coords2_bright = coords2[sort2]
+        indices1_bright = sort1
+        indices2_bright = sort2
+    else:
+        coords1_bright = coords1
+        coords2_bright = coords2
+        indices1_bright = np.arange(len(coords1))
+        indices2_bright = np.arange(len(coords2))
+    
+    # Nimm die N hellsten Sterne für initiales Matching
+    n_bright = min(100, len(coords1_bright), len(coords2_bright))
+    
+    best_offset = None
+    best_n_matches = 0
+    rng = np.random.default_rng(0)
+    
+    # RANSAC-artiger Ansatz: Teste verschiedene Hypothesen
+    # Verwende bevorzugt Sterne innerhalb des Radius für die Offset-Bestimmung
+    n_iterations = min(50, n_bright)
+    
+    for iteration in range(n_iterations):
+        # Wähle einen Stern aus Bild 1, bevorzuge Sterne im Radius
+        if iteration < min(10, n_bright):
+            # Erste Iterationen: systematisch die hellsten
+            i1_bright = iteration
+        else:
+            # Später: zufällige Auswahl, bevorzuge Sterne im Radius
+            if indices1_in_radius is not None and len(indices1_in_radius) > 0 and rng.random() < 0.7:
+                # 70% Chance: wähle einen Stern im Radius
+                candidates = [i for i in range(n_bright) if indices1_bright[i] in indices1_in_radius]
+                if candidates:
+                    i1_bright = rng.choice(candidates)
+                else:
+                    i1_bright = rng.integers(0, n_bright)
+            else:
+                i1_bright = rng.integers(0, n_bright)
+        
+        star1 = coords1_bright[i1_bright]
+        
+        # Suche in Bild 2 nach möglichen Matches
+        for i2_bright in range(min(n_bright, len(coords2_bright))):
+            star2 = coords2_bright[i2_bright]
+            
+            # Hypothetischer Offset
+            offset = star2 - star1
+            
+            # Teste diesen Offset: transformiere alle Sterne aus Bild 1
+            coords1_transformed = coords1 + offset
+            
+            # Zähle wie viele Matches wir mit diesem Offset bekommen
+            matches = []
+            used2 = set()
+            for j1 in range(len(coords1)):
+                dists = np.linalg.norm(coords2 - coords1_transformed[j1], axis=1)
+                j2 = int(np.argmin(dists))
+                if dists[j2] <= max_sep and j2 not in used2:
+                    matches.append((j1, j2))
+                    used2.add(j2)
+            
+            # Ist dies die beste Hypothese bisher?
+            if len(matches) > best_n_matches:
+                best_n_matches = len(matches)
+                best_offset = offset
+                
+                # Früher Abbruch wenn wir genug Matches haben
+                if best_n_matches > min(len(coords1), len(coords2)) * 0.3:
+                    break
+        
+        if best_n_matches > min(len(coords1), len(coords2)) * 0.3:
+            break
+    
+    # Wende den besten Offset an und finde finale Matches
+    if best_offset is not None:
+        coords1_transformed = coords1 + best_offset
+        
+        # Finde alle Matches
+        all_matches = []
+        used2 = set()
+        for i1 in range(len(coords1)):
+            dists = np.linalg.norm(coords2 - coords1_transformed[i1], axis=1)
+            i2 = int(np.argmin(dists))
+            
+            if dists[i2] <= max_sep and i2 not in used2:
+                all_matches.append((i1, i2))
+                used2.add(i2)
+        
+        # Filtere Matches: NUR Sterne die im B-Filter (tab1) innerhalb des Radius liegen
+        if indices1_in_radius is not None:
+            filtered_matches = [(i1, i2) for i1, i2 in all_matches if i1 in indices1_in_radius]
+            print(f"Gefundener Offset zwischen Bildern: dx={best_offset[0]:.1f}, dy={best_offset[1]:.1f} Pixel")
+            print(f"Matches gesamt: {len(all_matches)}, nach Radius-Filterung (B-Filter): {len(filtered_matches)}")
+            return filtered_matches, best_offset
+        else:
+            print(f"Gefundener Offset zwischen Bildern: dx={best_offset[0]:.1f}, dy={best_offset[1]:.1f} Pixel")
+            print(f"Matches nach Transformation: {len(all_matches)}")
+            return all_matches, best_offset
+    
+    print("Warnung: Kein robuster Offset gefunden. Keine Matches möglich.")
+    return [], None
+
+
+def select_reference_star(images, phot_tables, matched_indices, aperture_radius, calibration_file=None, output_folder=None):
+    """Interaktive Auswahl eines oder mehrerer Referenzsterne und Eingabe ihrer wahren Magnituden.
+    
+    Args:
+        calibration_file: Optional - Pfad zum Speichern der Kalibrierungsdaten
+        output_folder: Optional - Ordner für Ausgabedateien (PNG, etc.)
+    
+    Returns:
+        Einzelner Stern: (ref_index_B, mag_B_true, mag_V_true, ref_x, ref_y)
+        Mehrere Sterne: (ref_indices_B, mags_B_true, mags_V_true, ref_xs, ref_ys)
+        oder (None, None, None, None, None) bei Abbruch
+    """
+    if len(images) < 1 or phot_tables[0] is None:
+        print("Keine Daten für Referenzstern-Auswahl verfügbar.")
+        return None, None, None, None, None
+    
+    data, header = images[0]  # B-Filter Bild
+    tab = phot_tables[0]
+    
+    # Erstelle Plot für interaktive Auswahl
+    fig, ax = plt.subplots(figsize=(10, 10))
+    ax.set_title('Klicken Sie auf alle Referenzsterne im B-Filter Bild\n(alle Klicks werden gesammelt; Fenster schließen beendet die Auswahl)')
+    
+    try:
+        norm = ImageNormalize(data, interval=ZScaleInterval())
+    except Exception:
+        norm = None
+    
+    ax.imshow(data, cmap='gray', origin='lower', norm=norm)
+    
+    # Speichere Koordinaten der gematchten Sterne für Click-Erkennung
+    if matched_indices is not None and len(matched_indices) > 0:
+        indices_B = [idx1 for idx1, idx2 in matched_indices]
+        coords = np.vstack((np.array(tab['x']), np.array(tab['y']))).T
+        coords_matched = coords[indices_B]
+    else:
+        coords_matched = np.array([])
+        indices_B = []
+    
+    selected_refs = []
+    selected_index_set = set()
+    
+    def onclick(event):
+        if event.inaxes != ax:
+            return
+        if len(coords_matched) == 0:
+            return
+        
+        click_pos = np.array([event.xdata, event.ydata])
+        dists = np.linalg.norm(coords_matched - click_pos, axis=1)
+        nearest_idx = int(np.argmin(dists))
+        
+        if dists[nearest_idx] < aperture_radius * 3:  # Innerhalb 3x Aperturradius
+            ref_index = int(indices_B[nearest_idx])
+            ref_pos = coords_matched[nearest_idx]
+            if ref_index in selected_index_set:
+                print(f"Referenzstern mit Index {ref_index} bereits ausgewählt.")
+                return
+            selected_index_set.add(ref_index)
+            selected_refs.append({'index': ref_index, 'pos': ref_pos})
+            
+            ax.plot(ref_pos[0], ref_pos[1], 'r*', markersize=20,
+                   markeredgewidth=2, markeredgecolor='white')
+            fig.canvas.draw()
+            
+            print(f"\nReferenzstern {len(selected_refs)} ausgewählt: Index {ref_index}, "
+                  f"Position ({ref_pos[0]:.1f}, {ref_pos[1]:.1f})")
+            print("Klicken Sie weitere Referenzsterne an; das Fenster schließt die Auswahl.")
+    
+    cid = fig.canvas.mpl_connect('button_press_event', onclick)
+    plt.show()
+    fig.canvas.mpl_disconnect(cid)
+    
+    if len(selected_refs) == 0:
+        print("Kein Referenzstern ausgewählt.")
+        return None, None, None, None, None
+    
+    print(f"\n=== Eingabe der wahren Magnituden der {len(selected_refs)} Referenzsterne ===")
+    ref_indices = []
+    mag_B_values = []
+    mag_V_values = []
+    ref_x_values = []
+    ref_y_values = []
+    
+    for i, ref in enumerate(selected_refs, start=1):
+        try:
+            mag_B_true = float(input(f"B-Magnitude des Referenzsterns {i}/{len(selected_refs)} (Index {ref['index']}): "))
+            mag_V_true = float(input(f"V-Magnitude des Referenzsterns {i}/{len(selected_refs)} (Index {ref['index']}): "))
+        except (ValueError, EOFError):
+            print("Ungültige Eingabe. Kalibrierung abgebrochen.")
+            return None, None, None, None, None
+        
+        ref_indices.append(ref['index'])
+        mag_B_values.append(mag_B_true)
+        mag_V_values.append(mag_V_true)
+        ref_x_values.append(ref['pos'][0])
+        ref_y_values.append(ref['pos'][1])
+        print(f"  Referenzstern {i}: B={mag_B_true:.3f} mag, V={mag_V_true:.3f} mag")
+    
+    # Speichere Bild mit markierten Referenzsternen
+    if output_folder:
+        png_path = get_output_path(output_folder, 'reference_stars.png')
+        try:
+            fig.savefig(png_path, dpi=150, bbox_inches='tight')
+            print(f"Bild mit Referenzsternen gespeichert: {png_path}")
+        except Exception as e:
+            print(f"WARNUNG: Konnte Bild nicht speichern: {e}", file=sys.stderr)
+    
+    # Speichere Kalibrierungsdaten falls Datei angegeben
+    if calibration_file:
+        save_calibration(calibration_file, ref_indices, ref_x_values, ref_y_values, mag_B_values, mag_V_values)
+
+    if len(ref_indices) == 1:
+        idx = ref_indices[0]
+        return idx, mag_B_values[0], mag_V_values[0], ref_x_values[0], ref_y_values[0]
+
+    return np.array(ref_indices, dtype=int), np.array(mag_B_values, dtype=float), np.array(mag_V_values, dtype=float), np.array(ref_x_values, dtype=float), np.array(ref_y_values, dtype=float)
+
+
+def save_calibration(filename, ref_index, ref_x, ref_y, mag_B, mag_V):
+    """Speichere Kalibrierungsdaten in einer Textdatei.
+
+    Unterstützt einen einzelnen Stern oder mehrere Sterne pro Datei.
+    """
+    try:
+        if np.isscalar(ref_index) or isinstance(ref_index, (int, np.integer)):
+            ref_rows = [(int(ref_index), float(ref_x), float(ref_y), float(mag_B), float(mag_V))]
+        else:
+            ref_rows = []
+            ref_index_arr = np.atleast_1d(ref_index)
+            ref_x_arr = np.atleast_1d(ref_x)
+            ref_y_arr = np.atleast_1d(ref_y)
+            mag_B_arr = np.atleast_1d(mag_B)
+            mag_V_arr = np.atleast_1d(mag_V)
+            for i in range(len(ref_index_arr)):
+                ref_rows.append((int(ref_index_arr[i]), float(ref_x_arr[i]), float(ref_y_arr[i]), float(mag_B_arr[i]), float(mag_V_arr[i])))
+
+        with open(filename, 'w') as f:
+            f.write("# Photometrie Kalibrierungsdatei\n")
+            f.write(f"# Erstellt am: {np.datetime64('now')}\n")
+            f.write("#\n")
+            f.write("# Format: ref_index ref_x ref_y mag_B mag_V\n")
+            for ref_idx, x_coord, y_coord, b_mag, v_mag in ref_rows:
+                f.write(f"{ref_idx} {x_coord:.6f} {y_coord:.6f} {b_mag:.6f} {v_mag:.6f}\n")
+        print(f"Kalibrierungsdaten gespeichert in: {filename} ({len(ref_rows)} Referenzsterne)")
+    except Exception as e:
+        print(f"WARNUNG: Konnte Kalibrierungsdaten nicht speichern: {e}", file=sys.stderr)
+
+
+def save_photometry_table(filename, mags_V, colors_BV, x_coords=None, y_coords=None):
+    """Speichere Photometrie-Tabelle mit V und B-V Werten.
+    
+    Args:
+        filename: Pfad zur Ausgabedatei
+        mags_V: Array mit V-Magnituden
+        colors_BV: Array mit B-V Farben
+        x_coords: Optional - x-Koordinaten der Sterne
+        y_coords: Optional - y-Koordinaten der Sterne
+    """
+    try:
+        with open(filename, 'w') as f:
+            f.write("# Photometrie-Tabelle des Sternhaufens\n")
+            f.write(f"# Erstellt am: {np.datetime64('now')}\n")
+            f.write("#\n")
+            if x_coords is not None and y_coords is not None:
+                f.write("# Format: index x y V B-V\n")
+                f.write("# x y: Pixel-Koordinaten im B-Filter Bild\n")
+            else:
+                f.write("# Format: index V B-V\n")
+            f.write("# V: V-Magnitude (mag)\n")
+            f.write("# B-V: Farbindex (mag)\n")
+            f.write("#\n")
+            
+            for i in range(len(mags_V)):
+                if x_coords is not None and y_coords is not None:
+                    f.write(f"{i:4d} {x_coords[i]:8.2f} {y_coords[i]:8.2f} {mags_V[i]:7.3f} {colors_BV[i]:7.3f}\n")
+                else:
+                    f.write(f"{i:4d} {mags_V[i]:7.3f} {colors_BV[i]:7.3f}\n")
+        
+        print(f"Photometrie-Tabelle gespeichert: {filename}")
+        print(f"  {len(mags_V)} Sterne gespeichert")
+    except Exception as e:
+        print(f"WARNUNG: Konnte Photometrie-Tabelle nicht speichern: {e}", file=sys.stderr)
+
+
+def load_calibration(filename, phot_tables, matched_indices):
+    """Lade Kalibrierungsdaten aus einer Textdatei.
+    
+    Returns:
+        Ein einzelner Stern: (ref_index_B, mag_B_true, mag_V_true, ref_x, ref_y)
+        Mehrere Sterne: (ref_indices_B, mags_B_true, mags_V_true, ref_xs, ref_ys)
+        oder (None, None, None, None, None) bei Fehler
+    """
+    entries = []
+    try:
+        with open(filename, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith('#') or not line:
+                    continue
+                
+                parts = line.split()
+                if len(parts) >= 5:
+                    ref_index = int(parts[0])
+                    ref_x = float(parts[1])
+                    ref_y = float(parts[2])
+                    mag_B = float(parts[3])
+                    mag_V = float(parts[4])
+                    entries.append((ref_index, ref_x, ref_y, mag_B, mag_V))
+
+        if len(entries) == 0:
+            print(f"FEHLER: Keine gültigen Kalibrierungsdaten in {filename} gefunden.")
+            return None, None, None, None, None
+
+        loaded_ref_indices = []
+        loaded_mag_B = []
+        loaded_mag_V = []
+        loaded_x = []
+        loaded_y = []
+
+        for ref_index, ref_x, ref_y, mag_B, mag_V in entries:
+            print(f"Kalibrierungsdaten geladen aus: {filename}")
+            print(f"  Referenzstern (gespeichert): Index {ref_index}, Position ({ref_x:.1f}, {ref_y:.1f})")
+            print(f"  Magnituden: B={mag_B:.3f}, V={mag_V:.3f}")
+
+            mapped_ref_index = ref_index
+
+            if phot_tables and phot_tables[0] is not None:
+                tabB = phot_tables[0]
+                coords = np.vstack((np.array(tabB['x']), np.array(tabB['y']))).T
+                ref_pos = np.array([ref_x, ref_y])
+                dists = np.linalg.norm(coords - ref_pos, axis=1)
+                nearest_idx = int(np.argmin(dists))
+                nearest_dist = float(dists[nearest_idx])
+
+                if nearest_dist <= 8.0:
+                    mapped_ref_index = nearest_idx
+                    print(f"  Referenzstern remapped über Koordinaten: Index {mapped_ref_index} (Δ={nearest_dist:.2f} px)")
+                else:
+                    print(f"WARNUNG: Nächster Stern liegt {nearest_dist:.2f} px entfernt. Verwende gespeicherten Index {ref_index}.")
+
+            if matched_indices:
+                found = any(idx1 == mapped_ref_index for idx1, idx2 in matched_indices)
+                if not found and phot_tables and phot_tables[0] is not None:
+                    tabB = phot_tables[0]
+                    coords = np.vstack((np.array(tabB['x']), np.array(tabB['y']))).T
+                    ref_pos = np.array([ref_x, ref_y])
+                    matched_b = np.array([idx1 for idx1, _ in matched_indices], dtype=int)
+                    matched_coords = coords[matched_b]
+                    dists_m = np.linalg.norm(matched_coords - ref_pos, axis=1)
+                    j = int(np.argmin(dists_m))
+                    mapped_ref_index = int(matched_b[j])
+                    print(f"  Referenzstern auf nächsten gematchten B-Stern gelegt: Index {mapped_ref_index} (Δ={dists_m[j]:.2f} px)")
+                elif not found:
+                    print("WARNUNG: Referenzstern ist nicht in den gematchten Sternen und konnte nicht remapped werden.")
+                    return None, None, None, None, None
+
+            loaded_ref_indices.append(mapped_ref_index)
+            loaded_mag_B.append(mag_B)
+            loaded_mag_V.append(mag_V)
+            loaded_x.append(ref_x)
+            loaded_y.append(ref_y)
+
+        if len(loaded_ref_indices) == 1:
+            return loaded_ref_indices[0], loaded_mag_B[0], loaded_mag_V[0], loaded_x[0], loaded_y[0]
+
+        return (np.array(loaded_ref_indices, dtype=int),
+                np.array(loaded_mag_B, dtype=float),
+                np.array(loaded_mag_V, dtype=float),
+                np.array(loaded_x, dtype=float),
+                np.array(loaded_y, dtype=float))
+
+    except FileNotFoundError:
+        print(f"FEHLER: Kalibrierungsdatei nicht gefunden: {filename}")
+        return None, None, None, None, None
+    except Exception as e:
+        print(f"FEHLER beim Laden der Kalibrierungsdatei: {e}", file=sys.stderr)
+        return None, None, None, None, None
+
+
+def calibrate_magnitudes(matched, tabB, tabV, ref_index_B, mag_B_true, mag_V_true):
+    """Kalibriere alle Magnituden basierend auf einem oder mehreren Referenzsternen.
+    
+    Returns:
+        (calibrated_mags_B, calibrated_mags_V, colors_BV, matched_indices_valid)
+    """
+    sumsB = np.asarray(tabB['aperture_sum_bkgsub'])
+    sumsV = np.asarray(tabV['aperture_sum_bkgsub'])
+
+    if isinstance(ref_index_B, (list, tuple, np.ndarray)):
+        ref_entries = []
+        ref_idx_array = np.atleast_1d(ref_index_B)
+        mag_B_array = np.atleast_1d(mag_B_true)
+        mag_V_array = np.atleast_1d(mag_V_true)
+        for i in range(len(ref_idx_array)):
+            ref_entries.append((int(ref_idx_array[i]), float(mag_B_array[i]), float(mag_V_array[i])))
+    else:
+        ref_entries = [(int(ref_index_B), float(mag_B_true), float(mag_V_true))]
+
+    zeropoint_B_values = []
+    zeropoint_V_values = []
+
+    for ref_index, mag_B_target, mag_V_target in ref_entries:
+        ref_match_idx = None
+        ref_index_V = None
+        for i, (iB, iV) in enumerate(matched):
+            if iB == ref_index:
+                ref_match_idx = i
+                ref_index_V = iV
+                break
+
+        if ref_match_idx is None:
+            print(f"FEHLER: Referenzstern {ref_index} nicht in den Matches gefunden!")
+            return None, None, None, None
+
+        ref_flux_B = sumsB[ref_index]
+        ref_flux_V = sumsV[ref_index_V]
+
+        if ref_flux_B <= 0 or ref_flux_V <= 0:
+            print(f"FEHLER: Referenzstern {ref_index} hat negativen oder Null-Flux!")
+            return None, None, None, None
+
+        mag_B_inst_ref = -2.5 * np.log10(ref_flux_B)
+        mag_V_inst_ref = -2.5 * np.log10(ref_flux_V)
+
+        zeropoint_B = mag_B_target - mag_B_inst_ref
+        zeropoint_V = mag_V_target - mag_V_inst_ref
+        zeropoint_B_values.append(zeropoint_B)
+        zeropoint_V_values.append(zeropoint_V)
+
+        print(f"\n=== Referenzstern {ref_index} ===")
+        print(f"B_true = {mag_B_target:.3f}, V_true = {mag_V_target:.3f}, (B-V)_true = {mag_B_target - mag_V_target:.3f}")
+        print(f"Instrumentale Magnituden: B_inst = {mag_B_inst_ref:.3f}, V_inst = {mag_V_inst_ref:.3f}")
+        print(f"Nullpunkte: ZP_B = {zeropoint_B:.3f} mag, ZP_V = {zeropoint_V:.3f} mag")
+
+    if len(zeropoint_B_values) == 0:
+        print("FEHLER: Keine gültigen Referenzsterne für die Kalibrierung verfügbar.")
+        return None, None, None, None
+
+    zeropoint_B = float(np.median(zeropoint_B_values))
+    zeropoint_V = float(np.median(zeropoint_V_values))
+
+    print(f"\n=== Kalibrierung Debug ===")
+    print(f"Verwendete Nullpunkte (Median über {len(zeropoint_B_values)} Referenzsterne): ZP_B = {zeropoint_B:.3f} mag, ZP_V = {zeropoint_V:.3f} mag")
+    print(f"Differenz: ZP_V - ZP_B = {zeropoint_V - zeropoint_B:.3f} mag")
+    
+    mags_B = []
+    mags_V = []
+    colors = []
+    valid_matches = []
+    
+    for iB, iV in matched:
+        flux_B = sumsB[iB]
+        flux_V = sumsV[iV]
+        
+        if flux_B > 0 and flux_V > 0:
+            mag_B = -2.5 * np.log10(flux_B) + zeropoint_B
+            mag_V = -2.5 * np.log10(flux_V) + zeropoint_V
+            color_BV = mag_B - mag_V
+            
+            mags_B.append(mag_B)
+            mags_V.append(mag_V)
+            colors.append(color_BV)
+            valid_matches.append((iB, iV))
+    
+    colors_array = np.array(colors)
+    print(f"\nKalibrierte Photometrie:")
+    print(f"  {len(colors_array)} Sterne erfolgreich kalibriert")
+    print(f"  B-V: min={np.min(colors_array):.3f}, max={np.max(colors_array):.3f}, median={np.median(colors_array):.3f}")
+    print(f"  WARNUNG: Wenn B-V median < 0, könnte B und V vertauscht sein!")
+    
+    return np.array(mags_B), np.array(mags_V), colors_array, valid_matches
+
+
+def instrumental_magnitude(flux: float, zero_point: float = 25.0) -> Optional[float]:
+    """Berechne instrumentale Magnitude aus Flux.
+    
+    Formel: mag = -2.5 * log10(flux) + zero_point
+    
+    Der zero_point sollte so gewählt werden, dass typische Sterne positive Magnituden haben.
+    Standard: 25.0 (ergibt positive Magnituden für typische Flüsse)
+    """
+    try:
+        if flux <= 0:
+            return None
+        return -2.5 * np.log10(flux) + zero_point
+    except Exception:
+        return None
+
+
+def load_parsec_table(filepath, age_log, main_sequence_only=False):
+    """Lade PARSEC-Isochrone aus einer Multi-Age-Tabelle.
+    
+    Diese Funktion liest CMD 3.7/3.8 Output-Dateien die mehrere Alter enthalten.
+    
+    Args:
+        filepath: Pfad zur PARSEC-Tabelle (z.B. isochrones.txt)
+        age_log: Gewünschtes log(age) in Jahren
+        main_sequence_only: Wenn True, nur Hauptreihen-Sterne (label <= 1)
+    
+    Returns:
+        (B-V, M_V) Arrays oder (None, None) bei Fehler
+    """
+    print(f"  Lade PARSEC-Tabelle: {filepath}")
+    
+    try:
+        # Lese alle Zeilen
+        with open(filepath, 'r') as f:
+            lines = f.readlines()
+        
+        # Finde Header-Zeile um Spalten zu identifizieren
+        header_line = None
+        data_start = 0
+        for i, line in enumerate(lines):
+            if line.startswith('# Zini'):
+                header_line = line
+                data_start = i + 1
+                break
+        
+        if header_line is None:
+            print(f"  WARNUNG: Kein Header gefunden in {filepath}")
+            return None, None
+        
+        # Parse Header um Spalten-Indices zu finden
+        header_parts = header_line.replace('#', '').strip().split()
+        
+        try:
+            col_logage = header_parts.index('logAge')
+            col_bmag = header_parts.index('Bmag')
+            col_vmag = header_parts.index('Vmag')
+            col_label = header_parts.index('label') if 'label' in header_parts else None
+            if main_sequence_only and col_label is not None:
+                print(f"  Spalten gefunden: logAge={col_logage}, Bmag={col_bmag}, Vmag={col_vmag}, label={col_label} (nur Hauptreihe)")
+            else:
+                print(f"  Spalten gefunden: logAge={col_logage}, Bmag={col_bmag}, Vmag={col_vmag}")
+        except ValueError as e:
+            print(f"  FEHLER: Spalte nicht gefunden: {e}")
+            return None, None
+        
+        # Sammle Daten für das gewünschte Alter
+        b_v_list = []
+        v_abs_list = []
+        ages_found = set()
+        parsed_rows = []
+        n_total = 0
+        n_filtered = 0
+        
+        for line in lines[data_start:]:
+            # Überspringe Kommentare und leere Zeilen
+            if line.startswith('#') or not line.strip():
+                continue
+            
+            parts = line.split()
+            if len(parts) < max(col_logage, col_bmag, col_vmag) + 1:
+                continue
+            
+            try:
+                logage = float(parts[col_logage])
+                ages_found.add(logage)
+
+                # Parse Zeile und speichere für zweite Pass-Runde (nächstes Tabellenalter).
+                b_mag = float(parts[col_bmag])
+                v_mag = float(parts[col_vmag])
+                label_val = None
+                if col_label is not None and len(parts) > col_label:
+                    try:
+                        label_val = int(parts[col_label])
+                    except (ValueError, IndexError):
+                        label_val = None
+                parsed_rows.append((logage, b_mag, v_mag, label_val))
+            except (ValueError, IndexError):
+                continue
+
+        if len(ages_found) == 0:
+            print(f"  WARNUNG: Keine gültigen Alterswerte in {filepath} gefunden!")
+            return None, None
+
+        # Wähle das nächste verfügbare Tabellenalter.
+        # Bei Gleichstand wird das kleinere Alter bevorzugt.
+        ages_available = np.array(sorted(ages_found), dtype=float)
+        diffs = np.abs(ages_available - age_log)
+        min_diff = np.min(diffs)
+        nearest_candidates = ages_available[np.isclose(diffs, min_diff, atol=1e-10)]
+        selected_age = float(np.min(nearest_candidates))
+
+        if not np.isclose(selected_age, age_log, atol=1e-4):
+            print(f"  Hinweis: log(age)={age_log:.3f} nicht direkt in Tabelle, verwende nächstes Alter {selected_age:.2f}")
+
+        select_tol = 1e-4
+        for logage, b_mag, v_mag, label_val in parsed_rows:
+            if abs(logage - selected_age) > select_tol:
+                continue
+
+            n_total += 1
+
+            # Filtere nach evolutionärem Stadium wenn gewünscht
+            if main_sequence_only and label_val is not None:
+                # PARSEC labels: 0 = pre-MS, 1 = MS, 2 = SGB, 3 = RGB, etc.
+                # Wir wollen nur 0 und 1 (pre-MS und MS)
+                if label_val > 1:
+                    n_filtered += 1
+                    continue
+
+            # Filtere unphysikalische Werte
+            if -15 < v_mag < 20 and -1 < (b_mag - v_mag) < 3:
+                b_v_list.append(b_mag - v_mag)
+                v_abs_list.append(v_mag)
+        
+        if len(b_v_list) == 0:
+            print(f"  WARNUNG: Keine Daten für log(age)={age_log:.3f} gefunden!")
+            if ages_found:
+                available = sorted(list(ages_found))[:10]  # Zeige erste 10
+                print(f"  Verfügbare Alter: {', '.join([f'{a:.2f}' for a in available])}...")
+            return None, None
+        
+        b_v = np.array(b_v_list)
+        v_abs = np.array(v_abs_list)
+        
+        if main_sequence_only and n_filtered > 0:
+            print(f"  Erfolgreich! {len(b_v)} Hauptreihen-Sterne (gefiltert: {n_filtered} Post-MS)")
+        else:
+            print(f"  Erfolgreich! {len(b_v)} Datenpunkte für log(age)={selected_age:.2f} (angefragt: {age_log:.3f})")
+        print(f"  B-V: [{np.min(b_v):.2f}, {np.max(b_v):.2f}], M_V: [{np.min(v_abs):.2f}, {np.max(v_abs):.2f}]")
+        
+        return b_v, v_abs
+        
+    except Exception as e:
+        print(f"  Fehler beim Laden: {e}")
+        return None, None
+
+
+def download_parsec_isochrone_cmd(age_log, z=0.0152):
+    """Lade echte PARSEC-Isochrone vom CMD 3.7 Web-Service.
+    
+    HINWEIS: Automatischer Download kann instabil sein!
+    Für beste Ergebnisse:
+    1. Gehen Sie zu: http://stev.oapd.inaf.it/cgi-bin/cmd
+    2. Wählen Sie:
+       - Evolutionary tracks: PARSEC v1.2S
+       - Photometric system: Bessell (Johnson-Cousins)
+       - Output: Isochrone tables
+       - log(age/yr): Ihr gewünschtes Alter (z.B. 7.0 für 10 Myr)
+       - Metallicity Z: 0.0152 (solar)
+    3. Klicken Sie "Submit"
+    4. Laden Sie die Datei herunter
+    5. Speichern Sie als 'isochrone_<log_age>.dat' im FITS-Ordner
+       ODER extrahieren Sie Spalten Bmag und Vmag und speichern als 2-Spalten-Datei (B-V, M_V)
+    
+    Args:
+        age_log: Logarithmus des Alters in Jahren (z.B. 7.0 für 10 Millionen Jahre)
+        z: Metallizität (Standard: 0.0152 = solar)
+    
+    Returns:
+        (B-V, M_V) Arrays oder (None, None) bei Fehler
+    """
+    import urllib.request
+    import urllib.parse
+    import time
+    
+    # CMD 3.7 Web-Service URL
+    base_url = "http://stev.oapd.inaf.it/cgi-bin/cmd"
+    
+    # Parameter für PARSEC v1.2S Isochrone
+    params = {
+        'cmd_version': '3.7',
+        'track_parsec': 'parsec_CAF09_v1.2S',
+        'track_colibri': 'parsec_CAF09_v1.2S_S_LMC_08_web',
+        'track_postagb': 'no',
+        'n_inTPC': '10',
+        'eta_reimers': '0.2',
+        'kind_interp': '1',
+        'kind_postagb': '-1',
+        'photsys_file': 'tab_mag_odfnew/tab_mag_bessell.dat',  # Johnson-Cousins UBVRI
+        'photsys_version': 'yang',
+        'dust_sourceM': 'dpmod60alox40',
+        'dust_sourceC': 'AMCSIC15',
+        'kind_mag': '2',  # Absolute magnitudes
+        'kind_dust': '0',  # No dust
+        'extinction_av': '0.0',
+        'imf_file': 'tab_imf/imf_kroupa_orig.dat',
+        'isoc_isagelog': '1',  # log(age)
+        'isoc_lagelow': str(age_log),
+        'isoc_lageupp': str(age_log),
+        'isoc_dlage': '0.0',
+        'isoc_ismetlog': '0',  # Linear Z
+        'isoc_zlow': str(z),
+        'isoc_zupp': str(z),
+        'isoc_dz': '0.0',
+        'output_kind': '0',  # Isochrone table
+        'output_evstage': '1',
+        'lf_maginf': '-15',
+        'lf_magsup': '20',
+        'lf_deltamag': '0.5',
+        'sim_mtot': '1.0e4',
+        'submit_form': 'Submit'
+    }
+    
+    try:
+        print(f"  Fordere PARSEC-Isochrone an (log(age)={age_log:.2f}, Z={z:.4f})...")
+        
+        # POST-Request
+        data = urllib.parse.urlencode(params).encode('ascii')
+        req = urllib.request.Request(base_url, data=data)
+        
+        with urllib.request.urlopen(req, timeout=30) as response:
+            result = response.read().decode('utf-8')
+        
+        # Extrahiere Download-URL aus der Antwort
+        # Der Server gibt eine HTML-Seite mit einem Link zur Datei zurück
+        import re
+        match = re.search(r'(output\d+\.dat)', result)
+        
+        if not match:
+            print("  WARNUNG: Keine Download-URL in Antwort gefunden")
+            return None, None
+        
+        output_file = match.group(1)
+        download_url = f"http://stev.oapd.inaf.it/~webmaster/tmp/{output_file}"
+        
+        print(f"  Lade Daten von: {download_url}")
+        time.sleep(1)  # Kurze Pause um Server nicht zu überlasten
+        
+        with urllib.request.urlopen(download_url, timeout=30) as response:
+            data_text = response.read().decode('utf-8')
+        
+        # Parse die Daten
+        lines = data_text.strip().split('\n')
+        b_v_list = []
+        v_abs_list = []
+        
+        for line in lines:
+            # Überspringe Kommentare und Header
+            if line.startswith('#') or not line.strip():
+                continue
+            
+            parts = line.split()
+            if len(parts) < 20:
+                continue
+            
+            try:
+                # PARSEC Spalten (typisch):
+                # Cols: Zini logAge Mini Mass logL logTe [B-V] U B V R I J H K
+                # Die genaue Position hängt vom Output ab
+                # Für bessell.dat: Spalten sind etwa bei Index 14-19
+                
+                # Typischerweise:
+                # col 0: Z, 1: log(age), 2: M_ini, 3: Mass, 4: logL, 5: logTe
+                # col 6-10: stage info
+                # col ~14: B mag, ~15: V mag
+                
+                # Sicherer: Suche nach B und V in den letzten Spalten
+                # Format: ... Bmag Vmag Rmag Imag ...
+                if len(parts) >= 16:
+                    b_mag = float(parts[14])  # B (absolute)
+                    v_mag = float(parts[15])  # V (absolute)
+                    
+                    # Filtere unphysikalische Werte
+                    if -15 < v_mag < 20 and -1 < (b_mag - v_mag) < 3:
+                        b_v_list.append(b_mag - v_mag)
+                        v_abs_list.append(v_mag)
+            except (ValueError, IndexError):
+                continue
+        
+        if len(b_v_list) == 0:
+            print("  WARNUNG: Keine gültigen Datenpunkte gefunden")
+            return None, None
+        
+        b_v = np.array(b_v_list)
+        v_abs = np.array(v_abs_list)
+        
+        print(f"  Erfolgreich! {len(b_v)} Datenpunkte, B-V: [{np.min(b_v):.2f}, {np.max(b_v):.2f}]")
+        
+        return b_v, v_abs
+        
+    except Exception as e:
+        print(f"  Fehler beim Laden von CMD 3.7: {e}")
+        return None, None
+
+
+def download_isochrone_cmd(age_log, z=0.0152, output_file=None, main_sequence_only=False):
+    """Lade Isochrone - versuche verschiedene Methoden.
+    
+    Args:
+        age_log: Logarithmus des Alters in Jahren (z.B. 7.0 für 10 Millionen Jahre)
+        z: Metallizität (Standard: 0.0152 = solar)
+        output_file: Optional - Pfad zum Speichern der Isochrone
+        main_sequence_only: Wenn True, nur Hauptreihen-Sterne laden
+    
+    Returns:
+        (B-V, V) Arrays oder (None, None) bei Fehler
+    """
+    print(f"Lade Isochrone für log(age)={age_log:.2f}, Z={z:.4f}...")
+    
+    # Methode 1: Suche nach isochrones.txt (Multi-Age PARSEC-Tabelle) im gleichen Ordner wie photo.py
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    parsec_table = os.path.join(script_dir, 'isochrones.txt')
+    
+    if os.path.exists(parsec_table):
+        print(f"  Gefunden: Multi-Age PARSEC-Tabelle")
+        b_v, v_abs = load_parsec_table(parsec_table, age_log, main_sequence_only=main_sequence_only)
+        if b_v is not None:
+            return b_v, v_abs
+        print(f"  Konnte log(age)={age_log:.2f} nicht in Tabelle finden, versuche andere Methoden...")
+    
+    # Methode 2: Versuche lokale Datei zu laden falls vorhanden (gespeicherte Einzelalter-Isochrone)
+    if output_file and os.path.exists(output_file):
+        print(f"  Lade gespeicherte Isochrone: {output_file}")
+        try:
+            # Versuche verschiedene Formate
+            # Format 1: Einfach (B-V, M_V)
+            data = np.loadtxt(output_file, comments='#')
+            if len(data) > 0 and data.shape[1] >= 2:
+                print(f"  Erfolgreich! {len(data)} Datenpunkte geladen")
+                return data[:, 0], data[:, 1]
+        except Exception as e:
+            print(f"  Fehler beim Laden als 2-Spalten-Datei: {e}")
+            
+            # Format 2: PARSEC-Output (viele Spalten)
+            try:
+                b_v_list = []
+                v_abs_list = []
+                
+                with open(output_file, 'r') as f:
+                    for line in f:
+                        if line.startswith('#') or not line.strip():
+                            continue
+                        
+                        parts = line.split()
+                        if len(parts) < 2:
+                            continue
+                        
+                        try:
+                            # Versuche verschiedene Spalten-Konfigurationen
+                            if len(parts) >= 16:
+                                # Voller PARSEC-Output
+                                b_mag = float(parts[14])
+                                v_mag = float(parts[15])
+                            elif len(parts) >= 2:
+                                # Vereinfachtes Format: nur B-V und M_V
+                                b_v_val = float(parts[0])
+                                v_mag = float(parts[1])
+                                b_v_list.append(b_v_val)
+                                v_abs_list.append(v_mag)
+                                continue
+                            else:
+                                continue
+                            
+                            # Für volle PARSEC-Dateien
+                            if -15 < v_mag < 20 and -1 < (b_mag - v_mag) < 3:
+                                b_v_list.append(b_mag - v_mag)
+                                v_abs_list.append(v_mag)
+                        except (ValueError, IndexError):
+                            continue
+                
+                if len(b_v_list) > 0:
+                    print(f"  Erfolgreich! {len(b_v_list)} Datenpunkte aus PARSEC-Datei")
+                    return np.array(b_v_list), np.array(v_abs_list)
+            except Exception as e2:
+                print(f"  Fehler beim Parsen: {e2}")
+    
+    # NICHT mehr versuchen vom Server zu laden - zu instabil!
+    # Versuche echte PARSEC-Isochrone vom CMD 3.7 zu laden
+    # b_v, v_mag = download_parsec_isochrone_cmd(age_log, z)
+    # 
+    # # Falls erfolgreich, speichere für zukünftige Verwendung
+    # if b_v is not None and output_file:
+    #     try:
+    #         np.savetxt(output_file, np.column_stack([b_v, v_mag]), 
+    #                   header=f'B-V V_abs (log(age)={age_log:.2f}, Z={z:.4f})')
+    #         print(f"  Isochrone gespeichert: {output_file}")
+    #     except Exception as e:
+    #         print(f"  Warnung: Konnte nicht speichern: {e}")
+    #     return b_v, v_mag
+    
+    # Fallback: Verwende theoretisches Modell
+    print(f"  Konnte log(age)={age_log:.2f} nicht in isochrones.txt finden.")
+    print("  Fallback: Verwende theoretisches Modell...")
+    b_v, v_mag = generate_parsec_like_isochrone(age_log, z)
+    
+    # Speichere auch das theoretische Modell
+    if output_file and b_v is not None:
+        try:
+            np.savetxt(output_file, np.column_stack([b_v, v_mag]), 
+                      header=f'B-V V_abs (theoretical, log(age)={age_log:.2f}, Z={z:.4f})')
+            print(f"  Theoretische Isochrone gespeichert: {output_file}")
+        except Exception as e:
+            print(f"  Warnung: Konnte nicht speichern: {e}")
+    
+    return b_v, v_mag
+
+
+def generate_parsec_like_isochrone(age_log, z=0.0152):
+    """Erzeuge realistische Isochrone basierend auf PARSEC-Modellen.
+    
+    Verwendet empirische Fits an PARSEC-Isochrone für verschiedene Alter.
+    
+    Args:
+        age_log: Logarithmus des Alters in Jahren
+        z: Metallizität (Standard: 0.0152 = solar)
+    
+    Returns:
+        (B-V, V) Arrays
+    """
+    age = 10**age_log  # Jahre
+    age_gyr = age / 1e9  # Gigajahre
+    
+    # PARSEC Haupt-Sequenz Relation (empirisch angepasst)
+    # Basiert auf solarer Metallizität PARSEC v1.2S Isochrone
+    
+    # Massenbereiche für Hauptreihe
+    # Wir modellieren Sterne von ~0.5 bis ~50 Sonnenmassen (relevant für Haufen)
+    # MEHR Punkte für glattere Isochrone!
+    masses = np.concatenate([
+        np.linspace(0.5, 2.0, 100),    # Niedrige bis mittlere Massen
+        np.linspace(2.0, 10.0, 200),   # Mittlere Massen (sehr gut aufgelöst)
+        np.linspace(10.0, 50.0, 200)   # Hohe Massen (wichtig für junge Haufen!)
+    ])
+    
+    # Turn-off Masse hängt vom Alter ab
+    # Haupt-Sequenz Lifetime: t_MS ≈ 10 Gyr * (M/M_sun)^(-2.5)
+    # NGC 869: ~13 Myr → M_turnoff ~ 8-10 M_sun
+    
+    if age_gyr < 0.001:  # < 1 Million Jahre - extrem jung
+        m_turnoff = 50.0  # Alle Massen auf Hauptreihe
+    else:
+        # M_turnoff aus t_MS = age
+        m_turnoff = (10.0 / age_gyr) ** 0.4
+        m_turnoff = np.clip(m_turnoff, 0.8, 50.0)
+    
+    print(f"  Alter: {age/1e6:.1f} Myr, Turn-off Masse: {m_turnoff:.2f} M_sun")
+    
+    b_v_list = []
+    v_abs_list = []
+    
+    for m in masses:
+        if m <= m_turnoff:
+            # Hauptreihe - verbesserte Farb-Temperatur-Relation
+            # Basierend auf Spektraltypen und PARSEC-Daten
+            # Glatte Interpolation für bessere Isochrone
+            if m < 0.7:
+                bv = 1.4  # M-Sterne (sehr rot)
+            elif m < 1.0:
+                # K-Sterne - sanfter Übergang
+                t = (m - 0.7) / 0.3
+                bv = 1.4 * (1-t) + 0.8 * t
+            elif m < 1.5:
+                # G-Sterne
+                t = (m - 1.0) / 0.5
+                bv = 0.8 * (1-t) + 0.65 * t
+            elif m < 2.5:
+                # F-Sterne
+                t = (m - 1.5) / 1.0
+                bv = 0.65 * (1-t) + 0.3 * t
+            elif m < 7.0:
+                # A-Sterne
+                t = (m - 2.5) / 4.5
+                bv = 0.3 * (1-t) + 0.0 * t
+            elif m < 17.0:
+                # B-Sterne (wichtig!)
+                t = (m - 7.0) / 10.0
+                bv = 0.0 * (1-t) + (-0.15) * t
+            else:
+                # O-Sterne
+                t = min((m - 17.0) / 33.0, 1.0)
+                bv = -0.15 * (1-t) + (-0.25) * t
+            
+            bv = np.clip(bv, -0.33, 1.5)
+            
+            # Absolute V-Magnitude - verbesserte Masse-Leuchtkraft-Relation
+            # Wichtig: Für massive Sterne (M > 2 M_sun) ist die Relation flacher!
+            if m < 0.43:
+                # Sehr niedrige Massen: flache Relation
+                log_l = 2.3 * np.log10(m)
+            elif m < 2.0:
+                # Sonnenähnliche Sterne: L ~ M^4
+                log_l = 4.0 * np.log10(m)
+            elif m < 20.0:
+                # Massive Sterne: L ~ M^3.0 (flacher!)
+                # Wichtig für korrekte absolute Helligkeit
+                log_l = 3.0 * np.log10(m) + 0.3  # Offset für bessere Anpassung
+            else:
+                # Sehr massive Sterne: L ~ M^2.5
+                log_l = 2.5 * np.log10(m) + 0.6
+            
+            v_abs = 4.83 - 2.5 * log_l
+            
+        else:
+            # Post-Hauptreihe (Riesen, falls Turn-off erreicht)
+            # Werden röter und heller
+            bv = 0.8 + 0.3 * (m - m_turnoff) / m_turnoff
+            bv = np.clip(bv, 0.5, 2.0)
+            
+            # Heller als Turn-off-Punkt
+            m_to_log_l = 3.0 * np.log10(m_turnoff) + 0.3
+            m_to_v = 4.83 - 2.5 * m_to_log_l
+            v_abs = m_to_v - 2.0 * (m - m_turnoff) / m_turnoff
+            v_abs = np.clip(v_abs, -8.0, m_to_v)
+        
+        b_v_list.append(bv)
+        v_abs_list.append(v_abs)
+    
+    # Sortiere nach B-V für schöne Darstellung
+    b_v_array = np.array(b_v_list)
+    v_abs_array = np.array(v_abs_list)
+    
+    sort_idx = np.argsort(b_v_array)
+    b_v_array = b_v_array[sort_idx]
+    v_abs_array = v_abs_array[sort_idx]
+    
+    # Entferne Duplikate in B-V
+    unique_bv = []
+    unique_v = []
+    for i in range(len(b_v_array)):
+        if i == 0 or abs(b_v_array[i] - unique_bv[-1]) > 0.001:
+            unique_bv.append(b_v_array[i])
+            unique_v.append(v_abs_array[i])
+    
+    print(f"  Isochrone erstellt: {len(unique_bv)} Punkte, B-V: [{min(unique_bv):.2f}, {max(unique_bv):.2f}]")
+    
+    return np.array(unique_bv), np.array(unique_v)
+
+
+def fit_isochrone_distance_age(obs_bv, obs_v, ebv, age_range=(6.5, 8.5), age_steps=20, output_folder=None, fixed_age_myr=None):
+    """Bestimme Entfernung und Alter durch Isochrone-Anpassung.
+    
+    Args:
+        obs_bv: Beobachtete B-V Farben
+        obs_v: Beobachtete V-Magnituden
+        ebv: Rötung E(B-V)
+        age_range: (min_log_age, max_log_age) in Jahren (ignoriert wenn fixed_age_myr gesetzt)
+        age_steps: Anzahl der zu testenden Alter (ignoriert wenn fixed_age_myr gesetzt)
+        output_folder: Optional - Ordner zum Speichern von Plots
+        fixed_age_myr: Optional - Fixiertes Alter in Millionen Jahren (z.B. 10.6)
+    
+    Returns:
+        Dictionary mit: best_age_log, dm, distance_pc, chi2, iso_bv, iso_v, ebv, obs_bv_dereddened, obs_v_dereddened
+        oder None bei Fehler
+    """
+    print(f"\n=== Isochrone-Anpassung ===")
+    print(f"Rötung E(B-V) = {ebv:.3f} mag")
+    
+    if fixed_age_myr is not None:
+        # Fixiertes Alter
+        fixed_age_log = np.log10(fixed_age_myr * 1e6)
+        print(f"Fixiertes Alter: {fixed_age_myr} Myr (log(age) = {fixed_age_log:.3f})")
+        ages_log = np.array([fixed_age_log])
+        age_steps = 1
+    else:
+        print(f"Altersbereich: log(age) = {age_range[0]:.2f} - {age_range[1]:.2f}")
+        ages_log = np.linspace(age_range[0], age_range[1], age_steps)
+    
+    # Korrigiere Beobachtungen für Rötung
+    # A_V = 3.1 * E(B-V) (Standard-Extinktionsgesetz nach Cardelli et al.)
+    # A_B = 4.1 * E(B-V)
+    av = 3.1 * ebv
+    ab = 4.1 * ebv
+    
+    # Dereddening:
+    # (B-V)_0 = (B-V)_obs - E(B-V)
+    # V_0 = V_obs - A_V
+    obs_bv_dereddened = obs_bv - ebv
+    obs_v_dereddened = obs_v - av
+    
+    print(f"Extinktion A_V = {av:.3f} mag, A_B = {ab:.3f} mag")
+    print(f"Beobachtete Sterne:")
+    print(f"  B-V (beobachtet): min={np.min(obs_bv):.2f}, max={np.max(obs_bv):.2f}, median={np.median(obs_bv):.2f}")
+    print(f"  (B-V)_0 (dereddened): min={np.min(obs_bv_dereddened):.2f}, max={np.max(obs_bv_dereddened):.2f}, median={np.median(obs_bv_dereddened):.2f}")
+    print(f"  V (beobachtet): min={np.min(obs_v):.2f}, max={np.max(obs_v):.2f}, median={np.median(obs_v):.2f}")
+    print(f"  V_0 (dereddened): min={np.min(obs_v_dereddened):.2f}, max={np.max(obs_v_dereddened):.2f}, median={np.median(obs_v_dereddened):.2f}")
+    
+    # Teste verschiedene Alter (oder nur ein fixiertes Alter)
+    chi2_values = []
+    distance_moduli = []
+    
+    if fixed_age_myr is not None:
+        print(f"\nBestimme Entfernung für fixiertes Alter...")
+    else:
+        print(f"\nTeste {age_steps} Alter...")
+    
+    best_overall_age = None
+    best_overall_dm = None
+    best_overall_chi2 = np.inf
+    
+    for idx_age, age_log in enumerate(ages_log):
+        # Lade Isochrone - NUR HAUPTREIHE für Chi²-Anpassung!
+        iso_bv, iso_v = download_isochrone_cmd(age_log, main_sequence_only=True)
+        
+        if iso_bv is None or len(iso_bv) == 0:
+            chi2_values.append(np.inf)
+            distance_moduli.append(np.nan)
+            continue
+        
+        # WICHTIG: Beschränke Isochrone auf den B-V Bereich der Daten!
+        # Verwende BEOBACHTETE B-V (nicht dereddened) für Trimming!
+        # Die Isochrone ist intrinsisch, wird dann gerötet zum Vergleich
+        bv_min_data = np.min(obs_bv)  # BEOBACHTET
+        bv_max_data = np.max(obs_bv)  # BEOBACHTET
+        
+        # Röte die Isochrone für den Vergleich
+        iso_bv_reddened = iso_bv + ebv
+        
+        # Verwende nur Isochrone im BEOBACHTETEN Datenbereich (mit kleinem Puffer)
+        iso_mask = (iso_bv_reddened >= bv_min_data - 0.1) & (iso_bv_reddened <= bv_max_data + 0.1)
+        iso_bv_trimmed = iso_bv[iso_mask]  # Intrinsisch (für Fitting)
+        iso_v_trimmed = iso_v[iso_mask]
+        
+        if len(iso_bv_trimmed) == 0:
+            chi2_values.append(np.inf)
+            distance_moduli.append(np.nan)
+            continue
+        
+        # Finde bestes Entfernungsmodul durch vertikale Verschiebung
+        # Minimiere Chi² über alle möglichen Verschiebungen
+        # Für 1300 pc: DM = 5*log10(1300) - 5 = 10.57 mag
+        # Teste größeren Bereich: 9 bis 14 mag (500 pc bis 6300 pc)
+        
+        dm_range = np.arange(9.0, 14.0, 0.05)  # Feinere Schritte für bessere Genauigkeit
+        best_chi2 = np.inf
+        best_dm = np.nan
+        
+        # Speichere Chi² Kurve für Debug (nur bei fixiertem Alter)
+        chi2_curve = [] if fixed_age_myr is not None else None
+        dm_curve = [] if fixed_age_myr is not None else None
+        
+        for dm in dm_range:
+            # Verschiebe Isochrone (absolute V-Mag -> scheinbare V-Mag)
+            # Verwende nur den getrimmten Teil der Isochrone!
+            iso_v_shifted = iso_v_trimmed + dm
+            
+            # NEUE STRATEGIE: Anpassung an den BLAUEN RAND (ZAMS)
+            # Für jeden Stern: Finde hellsten Isochrone-Punkt bei ähnlicher Farbe
+            # Die Hauptreihe ist der blaue/helle Rand der Verteilung!
+            
+            chi2 = 0.0
+            n_matched = 0
+            total_weight = 0.0  # Für gewichtetes Mittel
+            
+            for i in range(len(obs_bv_dereddened)):
+                # Finde nächsten Punkt auf der Isochrone in B-V
+                color_diff = np.abs(iso_bv_trimmed - obs_bv_dereddened[i])
+                if len(color_diff) == 0:
+                    continue
+                    
+                idx = np.argmin(color_diff)
+                
+                # Nur verwenden wenn Farbe nahe genug (innerhalb 0.15 mag in B-V)
+                if color_diff[idx] < 0.15:
+                    v_diff = obs_v_dereddened[i] - iso_v_shifted[idx]
+                    
+                    # NUR Sterne verwenden, die am BLAUEN RAND liegen
+                    # v_diff < 0: Stern ist HELLER als Isochrone (physikalisch unrealistisch für ZAMS)
+                    # v_diff > 0: Stern ist SCHWÄCHER als Isochrone (Binäre, Post-MS, etc.)
+                    # Wir wollen nur Sterne nahe der ZAMS (kleine positive v_diff)
+                    if -0.5 <= v_diff <= 0.5:  # Stern ist max 0.5 mag vom Isochrone entfernt
+                        # Gewichte Sterne nahe der Isochrone stärker
+                        # Je näher am blauen Rand (kleine v_diff), desto höher das Gewicht
+                        weight = np.exp(-abs(v_diff) / 0.3)
+                        chi2 += weight * v_diff**2
+                        total_weight += weight
+                        n_matched += 1
+            
+            if n_matched > 5 and total_weight > 0:  # Mindestens 5 gematchte Sterne
+                chi2 /= total_weight  # Gewichtetes mittleres Chi² (robuster!)
+                
+                # WICHTIG: Regularisierung gegen unphysikalische Entfernungen
+                # Bevorzuge Entfernungen im Bereich 800-2000 pc (typisch für offene Haufen)
+                # Prior: Gaussian mit Zentrum bei 1300 pc, Breite 500 pc (engerer Prior!)
+                distance_pc = 10**((dm+5)/5)
+                distance_prior = np.exp(-((distance_pc - 1300)**2) / (2 * 500**2))
+                
+                # Kombiniere Chi² mit Prior (sehr starker Prior, Faktor 1.5)
+                # Dies bevorzugt physikalisch plausible Entfernungen sehr stark
+                # und verhindert Sprünge zu unphysikalischen lokalen Minima
+                chi2_with_prior = chi2 * (1 + 1.5 * (1 - distance_prior))
+                
+                # Speichere für Debug
+                if chi2_curve is not None:
+                    chi2_curve.append(chi2_with_prior)
+                    dm_curve.append(dm)
+                
+                if chi2_with_prior < best_chi2:
+                    best_chi2 = chi2_with_prior
+                    best_dm = dm
+        
+        # Debug: Zeige Chi² Kurve bei fixiertem Alter
+        if chi2_curve is not None and len(chi2_curve) > 0:
+            chi2_arr = np.array(chi2_curve)
+            dm_arr = np.array(dm_curve)
+            
+            # Finde alle lokalen Minima
+            local_minima = []
+            for i in range(1, len(chi2_arr) - 1):
+                if chi2_arr[i] < chi2_arr[i-1] and chi2_arr[i] < chi2_arr[i+1]:
+                    local_minima.append((dm_arr[i], chi2_arr[i], 10**((dm_arr[i]+5)/5)))
+            
+            print(f"\n  === Chi² Analyse für log(age)={age_log:.2f} ===")
+            print(f"  Gefundene lokale Minima: {len(local_minima)}")
+            for dm_min, chi2_min, dist_min in local_minima:
+                print(f"    DM={dm_min:.2f}, d={dist_min:.0f} pc, χ²/N={chi2_min:.4f}")
+            print(f"  Globales Minimum: DM={best_dm:.2f}, d={10**((best_dm+5)/5):.0f} pc, χ²/N={best_chi2:.4f}\n")
+        
+        # Debug: Zeige beste Anpassung für dieses Alter
+        if best_dm is not np.nan and not np.isnan(best_dm):
+            print(f"  log(age)={age_log:.2f}: DM={best_dm:.2f}, d={10**((best_dm+5)/5):.0f} pc, χ²/N={best_chi2:.3f}")
+        
+        chi2_values.append(best_chi2)
+        distance_moduli.append(best_dm)
+    
+    # Finde bestes Alter
+    chi2_values = np.array(chi2_values)
+    distance_moduli = np.array(distance_moduli)
+    
+    valid = np.isfinite(chi2_values)
+    if not np.any(valid):
+        print("FEHLER: Keine gültige Anpassung gefunden!")
+        return None
+    
+    best_idx = np.argmin(chi2_values[valid])
+    best_age_log = ages_log[valid][best_idx]
+    best_dm = distance_moduli[valid][best_idx]
+    best_chi2 = chi2_values[valid][best_idx]
+    
+    # Lade beste Isochrone nochmal
+    iso_bv_best, iso_v_best = download_isochrone_cmd(best_age_log)
+    
+    # Berechne Entfernung in Parsec
+    # m - M = 5 * log10(d) - 5
+    # d = 10^((m-M+5)/5)
+    distance_pc = 10**((best_dm + 5) / 5.0)
+    distance_ly = distance_pc * 3.26156  # Lichtjahre
+    
+    print(f"\n=== Ergebnisse ===")
+    if fixed_age_myr is not None:
+        print(f"Alter (fixiert): {fixed_age_myr} Millionen Jahre (log(age) = {best_age_log:.3f})")
+    else:
+        print(f"Bestes Alter: log(age) = {best_age_log:.2f} ({10**best_age_log / 1e6:.1f} Millionen Jahre)")
+    print(f"Entfernungsmodul: (m-M)_0 = {best_dm:.2f} mag")
+    print(f"Entfernung: d = {distance_pc:.0f} pc = {distance_pc/1000:.2f} kpc = {distance_ly:.0f} Lichtjahre")
+    print(f"Chi²/N = {best_chi2:.3f}")
+    print(f"\nZum Vergleich:")
+    print(f"  1000 pc → DM = {5*np.log10(1000)-5:.2f} mag")
+    print(f"  1300 pc → DM = {5*np.log10(1300)-5:.2f} mag")
+    print(f"  2000 pc → DM = {5*np.log10(2000)-5:.2f} mag")
+    
+    # Plotte Chi² vs. Alter - IMMER erstellen und speichern
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 7))
+    
+    # Chi² Plot
+    ax1.plot(ages_log[valid], chi2_values[valid], 'b.-')
+    ax1.axvline(best_age_log, color='r', linestyle='--', label=f'Best: log(age)={best_age_log:.2f}')
+    ax1.set_xlabel('log(Alter / Jahre)')
+    ax1.set_ylabel('χ²/N')
+    ax1.set_title('Isochronen-Anpassung: Chi² vs. Alter')
+    ax1.legend()
+    ax1.grid(alpha=0.3)
+    
+    # CMD mit bester Isochrone - zeige VOLLE Isochrone im Plot
+    iso_bv_best, iso_v_best = download_isochrone_cmd(best_age_log, main_sequence_only=False)
+    
+    ax2.scatter(obs_bv_dereddened, obs_v_dereddened, s=20, alpha=0.6, label='Beobachtungen (dereddened)')
+    if iso_bv_best is not None:
+        # Bestimme Bereich wo Sterne sind für Achsenbegrenzung
+        bv_min, bv_max = np.min(obs_bv_dereddened), np.max(obs_bv_dereddened)
+        v_min, v_max = np.min(obs_v_dereddened), np.max(obs_v_dereddened)
+        
+        # Erweitere um 10% für bessere Darstellung
+        bv_margin = (bv_max - bv_min) * 0.1
+        v_margin = (v_max - v_min) * 0.1
+        
+        # Filter Isochrone auf sichtbaren Bereich (etwas erweitert)
+        iso_mask = ((iso_bv_best >= bv_min - bv_margin) & 
+                    (iso_bv_best <= bv_max + bv_margin) &
+                    (iso_v_best + best_dm >= v_min - v_margin) &
+                    (iso_v_best + best_dm <= v_max + v_margin))
+        
+        ax2.plot(iso_bv_best[iso_mask], (iso_v_best + best_dm)[iso_mask], 
+                'r-', linewidth=2, label=f'Isochrone (log(age)={best_age_log:.2f}, DM={best_dm:.2f})')
+        
+        # Setze Achsenbegrenzung auf Sternbereich
+        ax2.set_xlim(bv_min - bv_margin, bv_max + bv_margin)
+        ax2.set_ylim(v_max + v_margin, v_min - v_margin)  # Invertiert!
+    ax2.set_xlabel('(B-V)₀ [mag]')
+    ax2.set_ylabel('V₀ [mag]')
+    ax2.set_title(f'CMD mit bester Isochrone\nd = {distance_pc:.0f} pc, Alter = {10**best_age_log/1e6:.1f} Myr')
+    ax2.legend()
+    ax2.grid(alpha=0.3)
+    
+    plt.tight_layout()
+    
+    # Speichere immer
+    if output_folder:
+        fit_plot_path = get_output_path(output_folder, 'isochrone_fit.png')
+        fig.savefig(fit_plot_path, dpi=150)
+        print(f"Anpassungs-Plot gespeichert: {fit_plot_path}")
+    
+    plt.show()
+    
+    # Gebe Dictionary mit allen Parametern zurück
+    return {
+        'age_log': best_age_log,
+        'dm': best_dm,
+        'distance_pc': distance_pc,
+        'chi2': best_chi2,
+        'iso_bv': iso_bv_best,
+        'iso_v': iso_v_best,
+        'ebv': ebv,
+        'obs_bv_dereddened': obs_bv_dereddened,
+        'obs_v_dereddened': obs_v_dereddened
+    }
+
+
+def plot_color_magnitude(matched, tabB, tabV, paths, n_total_B: int = None, n_total_V: int = None, 
+                         calibrated: bool = False, mags_B=None, mags_V=None, colors=None,
+                         save: Optional[str] = None, 
+                         isochrone_params: Optional[dict] = None,
+                         outlier_sigma: float = 3.0):
+    # Verwende entweder kalibrierte oder instrumentale Magnituden
+    if calibrated and mags_B is not None and mags_V is not None and colors is not None:
+        magsB = mags_B
+        magsV = mags_V
+        color = colors
+        ylabel = 'V (mag)'
+        title_prefix = 'Kalibriertes Color-Magnitude'
+    else:
+        # Verwende hintergrundkorrigierte Flüsse für instrumentale Photometrie
+        sumsB = np.asarray(tabB['aperture_sum_bkgsub'])
+        sumsV = np.asarray(tabV['aperture_sum_bkgsub'])
+        magsB = []
+        magsV = []
+        for iB, iV in matched:
+            magB = instrumental_magnitude(sumsB[iB])
+            magV = instrumental_magnitude(sumsV[iV])
+            if magB is None or magV is None:
+                continue
+            magsB.append(magB)
+            magsV.append(magV)
+        magsB = np.array(magsB)
+        magsV = np.array(magsV)
+        if len(magsB) == 0:
+            print("Keine validen Matches mit positivem Fluss gefunden.")
+            return
+        color = magsB - magsV  # B - V
+        ylabel = 'V (instrumental mag)'
+        title_prefix = 'Color-Magnitude'
+    
+    # Entferne Ausreißer basierend auf Sigma-Clipping für Farbe
+    # Realistische B-V Werte liegen zwischen etwa -0.3 und +2.0
+    color_median = np.median(color)
+    color_std = np.std(color)
+    color_mask = np.abs(color - color_median) <= outlier_sigma * color_std
+    
+    n_outliers = np.sum(~color_mask)
+    if n_outliers > 0:
+        print(f"\n⚠️  Entferne {n_outliers} Farb-Ausreißer (>{outlier_sigma:.1f}σ)")
+        print(f"    Original: B-V = {np.min(color):.2f}...{np.max(color):.2f}")
+        magsB = magsB[color_mask]
+        magsV = magsV[color_mask]
+        color = color[color_mask]
+        print(f"    Nach Filter: B-V = {np.min(color):.2f}...{np.max(color):.2f}")
+    
+    # Debug-Ausgabe für Diagnose
+    print(f"\n=== FHD Statistik ===")
+    print(f"Anzahl Sterne: {len(color)}")
+    print(f"V-Magnitude: min={np.min(magsV):.2f}, max={np.max(magsV):.2f}, median={np.median(magsV):.2f}")
+    print(f"B-V Farbe: min={np.min(color):.2f}, max={np.max(color):.2f}, median={np.median(color):.2f}")
+    
+    # Wenn unkalibriert und B-V sehr negativ: warne über Nullpunkt-Problem
+    if not calibrated and np.median(color) < -0.5:
+        offset = np.median(color)
+        print(f"\n⚠️  WARNUNG: B-V Median = {offset:.2f} ist sehr negativ!")
+        print(f"    Dies deutet auf unterschiedliche Nullpunkte zwischen B und V hin.")
+        print(f"    Für kalibrierte Magnituden verwenden Sie: --calibrate")
+        print(f"    Oder testen Sie grob: Die Hauptreihe hätte B-V ≈ {offset + 1.9:.2f} wenn")
+        print(f"    Sie {abs(offset):.2f} mag vom B-V Wert abziehen würden.")
+    
+    print(f"\nErwartung: Helle Sterne (kleine V) oben, schwache Sterne (große V) unten")
+    print(f"Erwartung: Blaue Sterne (negative/kleine B-V) links, rote Sterne (positive/große B-V) rechts")
+
+    fig, ax = plt.subplots(figsize=(7, 6))
+    ax.scatter(color, magsV, s=30, c='tab:blue', alpha=0.8, label='Beobachtungen')
+    
+    # Füge Isochrone hinzu wenn Parameter vorhanden
+    if isochrone_params is not None and calibrated:
+        iso_bv = isochrone_params['iso_bv']
+        iso_v = isochrone_params['iso_v']
+        dm = isochrone_params['dm']
+        age_log = isochrone_params['age_log']
+        ebv = isochrone_params['ebv']
+        distance_pc = isochrone_params['distance_pc']
+        
+        # WICHTIG: Wenn Isochronen-Parameter vorhanden, sind die Daten bereits dereddened!
+        # Isochrone ist intrinsisch, also direkt vergleichbar
+        iso_v_shifted = iso_v + dm  # Nur Entfernungsmodul, KEINE Extinktion
+        
+        # Filter Isochrone auf sichtbaren Bereich
+        bv_min, bv_max = np.min(color), np.max(color)
+        v_min, v_max = np.min(magsV), np.max(magsV)
+        bv_margin = (bv_max - bv_min) * 0.15
+        v_margin = (v_max - v_min) * 0.15
+        
+        iso_mask = ((iso_bv >= bv_min - bv_margin) & 
+                    (iso_bv <= bv_max + bv_margin) &
+                    (iso_v_shifted >= v_min - v_margin) &
+                    (iso_v_shifted <= v_max + v_margin))
+        
+        if np.any(iso_mask):
+            ax.plot(iso_bv[iso_mask], iso_v_shifted[iso_mask], 
+                   'r-', linewidth=2.5, alpha=0.8,
+                   label=f'Isochrone ({10**age_log/1e6:.1f} Myr)')
+        
+        # Aktualisiere Titel mit physikalischen Parametern
+        title = f'{title_prefix} (dereddened)\n'
+        title += f'd = {distance_pc:.0f} pc, Alter = {10**age_log/1e6:.1f} Myr, E(B-V) = {ebv:.3f}'
+    else:
+        # Titel mit Info über gefilterte Sterne
+        title = f'{title_prefix} ({os.path.basename(paths[0])} vs {os.path.basename(paths[1])})'
+        if n_total_B is not None and n_total_V is not None:
+            title += f'\n{len(color)} Sterne (gefiltert aus {n_total_B}/{n_total_V} Gesamtquellen)'
+    
+    ax.set_xlabel('(B-V)₀ [mag]')
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    
+    # Invertiere y-Achse für astronomische Orientierung:
+    # - y-Achse (V): kleine Magnituden (helle Sterne) oben
+    # - x-Achse (B-V): negative Werte (blaue Sterne) links (Standard)
+    ax.invert_yaxis()  # Heller oben
+    
+    # Füge ein Raster hinzu und markiere Null-Linie für B-V
+    ax.axvline(x=0, color='gray', linestyle=':', alpha=0.5)
+    ax.grid(alpha=0.3)
+    ax.legend()
+    
+    plt.tight_layout()
+    if save:
+        try:
+            fig.savefig(save, dpi=150)
+            print(f"Color-Magnitude Abbildung gespeichert: {save}")
+        except Exception as e:
+            print(f"Fehler beim Speichern des Color-Magnitude Diagramms: {e}", file=sys.stderr)
+    plt.show()
+
+
+def compute_instrumental_cmd_points(matched, tabB, tabV, outlier_sigma: float = 3.0):
+    """Berechne instrumentale CMD-Punkte (B-V, V) inkl. Sigma-Clipping der Farben."""
+    if matched is None or tabB is None or tabV is None or len(matched) == 0:
+        return None
+
+    sumsB = np.asarray(tabB['aperture_sum_bkgsub'])
+    sumsV = np.asarray(tabV['aperture_sum_bkgsub'])
+    magsB = []
+    magsV = []
+    x_coords = []
+    y_coords = []
+
+    for iB, iV in matched:
+        magB = instrumental_magnitude(sumsB[iB])
+        magV = instrumental_magnitude(sumsV[iV])
+        if magB is None or magV is None:
+            continue
+        magsB.append(magB)
+        magsV.append(magV)
+        x_coords.append(tabB['x'][iB])
+        y_coords.append(tabB['y'][iB])
+
+    magsB = np.array(magsB)
+    magsV = np.array(magsV)
+    x_coords = np.array(x_coords)
+    y_coords = np.array(y_coords)
+    if len(magsB) == 0:
+        return None
+
+    color = magsB - magsV
+    if len(color) > 1:
+        color_median = np.median(color)
+        color_std = np.std(color)
+        if color_std > 0:
+            color_mask = np.abs(color - color_median) <= outlier_sigma * color_std
+        else:
+            color_mask = np.ones_like(color, dtype=bool)
+    else:
+        color_mask = np.ones_like(color, dtype=bool)
+
+    return {
+        'color': color[color_mask],
+        'mag_v': magsV[color_mask],
+        'x': x_coords[color_mask],
+        'y': y_coords[color_mask],
+    }
+
+
+def find_nearest_source_index(tab, x_ref: float, y_ref: float, max_distance: Optional[float] = None):
+    """Finde den naechsten Stern in tab zu einer Referenzposition (x_ref, y_ref)."""
+    if tab is None or len(tab) == 0:
+        return None
+
+    coords = np.vstack((np.array(tab['x']), np.array(tab['y']))).T
+    ref = np.array([x_ref, y_ref])
+    dists = np.linalg.norm(coords - ref, axis=1)
+    idx = int(np.argmin(dists))
+
+    if max_distance is not None and dists[idx] > max_distance:
+        return None
+    return idx
+
+
+def compute_calibrated_cmd_points(matched, tabB, tabV, ref_index_B: int,
+                                  mag_B_true: float, mag_V_true: float,
+                                  outlier_sigma: float = 3.0,
+                                  ebv: Optional[float] = None):
+    """Berechne kalibrierte CMD-Punkte; optional mit Dereddening via E(B-V)."""
+    calib = calibrate_magnitudes(matched, tabB, tabV, ref_index_B, mag_B_true, mag_V_true)
+    if calib is None:
+        return None
+
+    magsB, magsV, colors, valid_matches = calib
+    if magsB is None or len(magsB) == 0:
+        return None
+
+    x_coords = np.array([tabB['x'][iB] for iB, _ in valid_matches])
+    y_coords = np.array([tabB['y'][iB] for iB, _ in valid_matches])
+
+    if len(colors) > 1:
+        color_median = np.median(colors)
+        color_std = np.std(colors)
+        if color_std > 0:
+            color_mask = np.abs(colors - color_median) <= outlier_sigma * color_std
+        else:
+            color_mask = np.ones_like(colors, dtype=bool)
+    else:
+        color_mask = np.ones_like(colors, dtype=bool)
+
+    color_plot = colors[color_mask]
+    magsV_plot = magsV[color_mask]
+
+    if ebv is not None:
+        color_plot = color_plot - ebv
+        magsV_plot = magsV_plot - 3.1 * ebv
+
+    return {
+        'color': color_plot,
+        'mag_v': magsV_plot,
+        'x': x_coords[color_mask],
+        'y': y_coords[color_mask],
+    }
+
+
+def plot_cmd_method_comparison(aperture_points, psf_points, paths, save: Optional[str] = None,
+                               calibrated: bool = False, dereddened: bool = False):
+    """Plotte CMD-Punkte fuer aperture und psf in verschiedenen Farben."""
+    if aperture_points is None and psf_points is None:
+        print("Keine CMD-Daten fuer den Methodenvergleich verfuegbar.")
+        return
+
+    fig, ax = plt.subplots(figsize=(7, 6))
+    plotted_any = False
+    n_connections = 0
+    delta_color_values = []
+    delta_mag_values = []
+
+    if aperture_points is not None:
+        color_ap = aperture_points['color']
+        magsV_ap = aperture_points['mag_v']
+        if len(color_ap) > 0:
+            ax.scatter(color_ap, magsV_ap, s=28, c='tab:blue', alpha=0.7,
+                       label=f'aperture ({len(color_ap)} Sterne)')
+            plotted_any = True
+
+    if psf_points is not None:
+        color_psf = psf_points['color']
+        magsV_psf = psf_points['mag_v']
+        if len(color_psf) > 0:
+            ax.scatter(color_psf, magsV_psf, s=28, c='tab:orange', alpha=0.7,
+                       label=f'psf ({len(color_psf)} Sterne)')
+            plotted_any = True
+
+    if aperture_points is not None and psf_points is not None:
+        ap_xy = np.column_stack((aperture_points['x'], aperture_points['y']))
+        psf_xy = np.column_stack((psf_points['x'], psf_points['y']))
+        used_psf = set()
+        max_position_delta = 2.0
+
+        for i_ap, xy_ap in enumerate(ap_xy):
+            if len(psf_xy) == 0:
+                break
+            dists = np.linalg.norm(psf_xy - xy_ap, axis=1)
+            i_psf = int(np.argmin(dists))
+            if dists[i_psf] > max_position_delta or i_psf in used_psf:
+                continue
+
+            used_psf.add(i_psf)
+            delta_color_values.append(psf_points['color'][i_psf] - aperture_points['color'][i_ap])
+            delta_mag_values.append(psf_points['mag_v'][i_psf] - aperture_points['mag_v'][i_ap])
+            ax.plot(
+                [aperture_points['color'][i_ap], psf_points['color'][i_psf]],
+                [aperture_points['mag_v'][i_ap], psf_points['mag_v'][i_psf]],
+                color='0.55', alpha=0.45, linewidth=1.6, zorder=1
+            )
+            n_connections += 1
+
+    if not plotted_any:
+        print("Keine validen CMD-Punkte fuer den Methodenvergleich gefunden.")
+        plt.close(fig)
+        return
+
+    if n_connections > 0:
+        print(f"  Verbindungssegmente fuer {n_connections} gemeinsame Sterne gezeichnet.")
+        delta_color_values = np.array(delta_color_values)
+        delta_mag_values = np.array(delta_mag_values)
+
+        rms_color = float(np.sqrt(np.mean(delta_color_values**2)))
+        rms_mag = float(np.sqrt(np.mean(delta_mag_values**2)))
+        mean_color = float(np.mean(delta_color_values))
+        mean_mag = float(np.mean(delta_mag_values))
+
+        color_tendency = 'PSF tendenziell roeter' if mean_color > 0 else 'PSF tendenziell blauer'
+        if np.isclose(mean_color, 0.0, atol=1e-4):
+            color_tendency = 'keine klare Farb-Tendenz'
+
+        mag_tendency = 'PSF tendenziell dunkler' if mean_mag > 0 else 'PSF tendenziell heller'
+        if np.isclose(mean_mag, 0.0, atol=1e-4):
+            mag_tendency = 'keine klare Helligkeits-Tendenz'
+
+        print(f"  RMS Delta(B-V) [psf-aperture] = {rms_color:.4f} mag")
+        print(f"  RMS Delta(V) [psf-aperture] = {rms_mag:.4f} mag")
+        print(f"  Mittel Delta(B-V) = {mean_color:+.4f} mag -> {color_tendency}")
+        print(f"  Mittel Delta(V) = {mean_mag:+.4f} mag -> {mag_tendency}")
+
+        stats_text = (
+            f'Gemeinsame Sterne: {n_connections}\n'
+            f'RMS Delta(B-V): {rms_color:.4f} mag\n'
+            f'RMS Delta(V): {rms_mag:.4f} mag\n'
+            f'Mittel Delta(B-V): {mean_color:+.4f} mag\n'
+            f'{color_tendency}\n'
+            f'Mittel Delta(V): {mean_mag:+.4f} mag\n'
+            f'{mag_tendency}'
+        )
+        ax.text(
+            0.02, 0.98, stats_text,
+            transform=ax.transAxes,
+            va='top', ha='left', fontsize=9,
+            bbox=dict(boxstyle='round', facecolor='white', alpha=0.85, edgecolor='0.7')
+        )
+
+    if calibrated:
+        if dereddened:
+            xlabel = '(B-V)0 [mag]'
+            ylabel = 'V0 [mag]'
+            title_mode = 'kalibriert + dereddened'
+        else:
+            xlabel = '(B-V) [mag]'
+            ylabel = 'V [mag]'
+            title_mode = 'kalibriert'
+    else:
+        xlabel = '(B-V) [mag]'
+        ylabel = 'V (instrumental mag)'
+        title_mode = 'instrumentell'
+
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_title(
+        f'CMD-Vergleich aperture vs psf ({title_mode})\n'
+        f'{os.path.basename(paths[0])} vs {os.path.basename(paths[1])}'
+    )
+    ax.axvline(x=0, color='gray', linestyle=':', alpha=0.5)
+    ax.grid(alpha=0.3)
+    ax.legend()
+    ax.invert_yaxis()
+
+    plt.tight_layout()
+    if save:
+        try:
+            fig.savefig(save, dpi=150)
+            print(f"CMD-Vergleich gespeichert: {save}")
+        except Exception as e:
+            print(f"Fehler beim Speichern des CMD-Vergleichs: {e}", file=sys.stderr)
+    plt.show()
+
+
+def _match_aperture_psf_entries(tab_aperture, tab_psf, max_sep: float = 3.0,
+                                cluster_center: Optional[Tuple[float, float]] = None,
+                                cluster_radius: Optional[float] = None,
+                                annulus_inner: Optional[float] = None,
+                                zero_point: float = 25.0) -> list:
+    """Matcht Apertur- und PSF-Quellen im selben Bild und liefert Delta(mag) je Stern.
+
+    Liefert eine (nach |Delta| absteigend sortierte) Liste von Tupeln
+    (x, y, mag_ap, mag_psf, delta, x_ap, y_ap, x_psf, y_psf), wobei x/y der
+    Mittelwert der Apertur- und PSF-Position ist.
+    """
+    if tab_aperture is None or tab_psf is None or len(tab_aperture) == 0 or len(tab_psf) == 0:
+        return []
+
+    xy_ap_all = np.column_stack((np.asarray(tab_aperture['x'], dtype=float), np.asarray(tab_aperture['y'], dtype=float)))
+    xy_psf = np.column_stack((np.asarray(tab_psf['x'], dtype=float), np.asarray(tab_psf['y'], dtype=float)))
+
+    # Optional auf Cluster-Radius/Annulus einschraenken
+    candidate_idx = np.arange(len(xy_ap_all))
+    if cluster_radius is not None and cluster_center is not None:
+        dist = np.linalg.norm(xy_ap_all - np.array(cluster_center), axis=1)
+        if annulus_inner is not None:
+            mask = (dist >= annulus_inner) & (dist <= cluster_radius)
+        else:
+            mask = dist <= cluster_radius
+        candidate_idx = np.where(mask)[0]
+
+    used_psf = set()
+    entries = []  # (x, y, mag_ap, mag_psf, delta, x_ap, y_ap, x_psf, y_psf)
+    for i_ap in candidate_idx:
+        if len(xy_psf) == 0:
+            break
+        dists = np.linalg.norm(xy_psf - xy_ap_all[i_ap], axis=1)
+        i_psf = int(np.argmin(dists))
+        if dists[i_psf] > max_sep or i_psf in used_psf:
+            continue
+
+        flux_ap = float(tab_aperture['aperture_sum_bkgsub'][i_ap])
+        flux_psf = float(tab_psf['aperture_sum_bkgsub'][i_psf])
+        mag_ap = instrumental_magnitude(flux_ap, zero_point=zero_point)
+        mag_psf = instrumental_magnitude(flux_psf, zero_point=zero_point)
+        if mag_ap is None or mag_psf is None:
+            continue
+
+        used_psf.add(i_psf)
+        x_ap, y_ap = float(xy_ap_all[i_ap][0]), float(xy_ap_all[i_ap][1])
+        x_psf, y_psf = float(xy_psf[i_psf][0]), float(xy_psf[i_psf][1])
+        x_avg = 0.5 * (x_ap + x_psf)
+        y_avg = 0.5 * (y_ap + y_psf)
+        entries.append((x_avg, y_avg, mag_ap, mag_psf, mag_psf - mag_ap, x_ap, y_ap, x_psf, y_psf))
+
+    entries.sort(key=lambda e: abs(e[4]), reverse=True)
+    return entries
+
+
+def plot_extraction_method_comparison_combined(data: np.ndarray, path: str, tab_aperture, tab_psf,
+                                               max_sep: float = 3.0,
+                                               cluster_center: Optional[Tuple[float, float]] = None,
+                                               cluster_radius: Optional[float] = None,
+                                               annulus_inner: Optional[float] = None,
+                                               aperture_radius: float = 9.0,
+                                               fwhm: float = 3.0,
+                                               zero_point: float = 25.0,
+                                               save: Optional[str] = None) -> None:
+    """Vergleiche Apertur- und PSF-Helligkeiten Stern fuer Stern im selben (V-)Bild.
+
+    Fasst drei Ansichten in einer Abbildung zusammen:
+    1. Das V-Bild mit nummerierten Sternen (Nummer 1 = groesste Abweichung).
+    2. Ein Saeulendiagramm Sternnummer gegen Delta(mag) = psf - aperture.
+    3. Ein 3D-Helligkeitsplot des Sterns mit der groessten Abweichung, ueberlagert mit
+       PSF-Gauss-Fit und Apertur-Radius.
+    """
+    entries = _match_aperture_psf_entries(
+        tab_aperture, tab_psf, max_sep=max_sep,
+        cluster_center=cluster_center, cluster_radius=cluster_radius,
+        annulus_inner=annulus_inner, zero_point=zero_point
+    )
+
+    if not entries:
+        print("Keine gemeinsamen Sterne fuer den Extraktionsmethoden-Vergleich gefunden.")
+        return
+
+    deltas = np.array([e[4] for e in entries])
+    rms = float(np.sqrt(np.mean(deltas**2)))
+    mean_delta = float(np.mean(deltas))
+    std_delta = float(np.std(deltas))
+    max_entry = entries[0]
+
+    print("\n=== Extraktionsmethoden-Vergleich (Apertur vs PSF) im V-Bild ===")
+    print(f"  Gemeinsame Sterne: {len(entries)}")
+    print(f"  RMS Delta(mag) [psf-aperture] = {rms:.4f} mag")
+    print(f"  Mittel Delta(mag) = {mean_delta:+.4f} mag, Std = {std_delta:.4f} mag")
+    print(f"  Groesste Abweichung: Stern #1 bei (x={max_entry[0]:.1f}, y={max_entry[1]:.1f}), "
+          f"Delta = {max_entry[4]:+.4f} mag (aperture={max_entry[2]:.3f}, psf={max_entry[3]:.3f})")
+
+    max_abs_delta = float(np.max(np.abs(deltas)))
+    if max_abs_delta <= 0:
+        max_abs_delta = 1e-6
+    cmap = plt.get_cmap('coolwarm')
+
+    fig = plt.figure(figsize=(14, 12))
+    gs = fig.add_gridspec(2, 2, height_ratios=[1.3, 1.0])
+    ax_img = fig.add_subplot(gs[0, 0])
+    ax_3d = fig.add_subplot(gs[0, 1], projection='3d')
+    # Deaktiviert Matplotlibs automatische Tiefensortierung, die Overlays (PSF-Fit,
+    # Zentren-Marker) sonst faelschlich hinter der Oberflaeche verschwinden laesst.
+    ax_3d.computed_zorder = False
+    # Feste, separate Colorbar-Achse neben ax_3d: fig.colorbar(ax=ax_3d) wuerde bei
+    # jeder Neuzeichnung (Klick) ax_3d ueber die Gridspec-Zuordnung erneut verkleinern.
+    ax_3d_pos = ax_3d.get_position()
+    cax_3d = fig.add_axes([ax_3d_pos.x1 + 0.015, ax_3d_pos.y0, 0.015, ax_3d_pos.height])
+    ax_bar = fig.add_subplot(gs[1, :])
+
+    # --- Panel 1: V-Bild mit nummerierten Sternen ---
+    try:
+        norm_img = ImageNormalize(data, interval=ZScaleInterval())
+    except Exception:
+        norm_img = None
+    ax_img.imshow(data, cmap='gray', origin='lower', norm=norm_img)
+    ax_img.set_title(f'V-Bild: nummerierte Sterne\n{os.path.basename(path)}')
+
+    for i, entry in enumerate(entries, start=1):
+        x, y, mag_ap, mag_psf, delta = entry[:5]
+        color = cmap(0.5 + 0.5 * (delta / max_abs_delta))
+        is_max = (i == 1)
+        ax_img.plot(x, y, 'o', markersize=10 if is_max else 7,
+                    markerfacecolor=color, markeredgecolor='yellow' if is_max else 'black',
+                    markeredgewidth=1.8 if is_max else 0.7, alpha=0.9)
+        ax_img.annotate(str(i), (x, y), textcoords="offset points", xytext=(6, 6),
+                        fontsize=9 if is_max else 7, color='yellow' if is_max else 'white',
+                        fontweight='bold' if is_max else 'normal')
+
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(vmin=-max_abs_delta, vmax=max_abs_delta))
+    sm.set_array([])
+    cbar = fig.colorbar(sm, ax=ax_img, fraction=0.046, pad=0.04)
+    cbar.set_label('\u0394mag (psf - aperture)')
+
+    stats_text = (
+        f'Gemeinsame Sterne: {len(entries)}\n'
+        f'RMS \u0394mag: {rms:.4f} mag\n'
+        f'Mittel \u0394mag: {mean_delta:+.4f} mag\n'
+        f'Std \u0394mag: {std_delta:.4f} mag\n'
+        f'Groesste Abw.: Stern #1 ({max_entry[4]:+.4f} mag)'
+    )
+    ax_img.text(0.02, 0.98, stats_text, transform=ax_img.transAxes, va='top', ha='left', fontsize=8,
+                bbox=dict(boxstyle='round', facecolor='white', alpha=0.85, edgecolor='0.7'))
+
+    # --- Panel 2: Saeulendiagramm Sternnummer vs Delta(mag) ---
+    numbers = np.arange(1, len(entries) + 1)
+    colors = [cmap(0.5 + 0.5 * (d / max_abs_delta)) for d in deltas]
+    bars = ax_bar.bar(numbers, deltas, color=colors, edgecolor='black', linewidth=0.4)
+    bars[0].set_edgecolor('yellow')
+    bars[0].set_linewidth(2.0)
+    ax_bar.axhline(0, color='gray', linewidth=1.0)
+    ax_bar.set_xlabel('Sternnummer (1 = gr\u00f6\u00dfte Abweichung)')
+    ax_bar.set_ylabel('\u0394mag (psf - aperture)')
+    ax_bar.set_title('Helligkeitsdifferenz pro Stern')
+    ax_bar.grid(alpha=0.3, axis='y')
+
+    # --- Panel 3: 3D-Helligkeitsplot eines Sterns (per Klick im linken Bild waehlbar) ---
+    from matplotlib.lines import Line2D
+
+    def _draw_star_3d_panel(entry, star_number):
+        ax_3d.clear()
+        ax_3d.computed_zorder = False
+        cax_3d.clear()
+        cax_3d.set_visible(True)
+
+        x, y, mag_ap, mag_psf, delta, x_ap, y_ap, x_psf, y_psf = entry
+        # Abstand der Apertur- und PSF-Zentren: grosser Wert deutet auf einen nahen
+        # Nachbarstern hin (Verwechslungsgefahr beim Matching). Der Ausschnitt wird
+        # entsprechend vergroessert, damit ein solcher Nachbar sichtbar bleibt.
+        center_sep = float(np.hypot(x_ap - x_psf, y_ap - y_psf))
+        half = int(np.ceil(max(12.0, 3.0 * aperture_radius, 6.0 * fwhm, 2.2 * center_sep + 10.0)))
+        ny, nx = data.shape
+        x0, y0 = int(round(x)), int(round(y))
+        xmin = max(0, x0 - half)
+        xmax = min(nx, x0 + half + 1)
+        ymin = max(0, y0 - half)
+        ymax = min(ny, y0 + half + 1)
+        cut = np.asarray(data[ymin:ymax, xmin:xmax], dtype=float)
+
+        if cut.size == 0:
+            ax_3d.set_title("Kein Bildausschnitt fuer den 3D-Sternplot verfuegbar.")
+            cax_3d.set_visible(False)
+            return
+
+        yy, xx = np.indices(cut.shape)
+        xx = xx + xmin
+        yy = yy + ymin
+
+        prof = _radial_profile_from_star(data, x_psf, y_psf, max_radius=half)
+        fit = None
+        bkg = float(np.median(cut))
+        if prof is not None:
+            r, y_prof, bkg = prof
+            fit = _fit_gaussian_psf_to_profile(r, y_prof, fwhm_hint=fwhm)
+
+        z_data = cut - bkg
+        surf = ax_3d.plot_surface(xx, yy, z_data, cmap='viridis', alpha=0.8, linewidth=0,
+                                  antialiased=True, rstride=1, cstride=1, zorder=1)
+        fig.colorbar(surf, cax=cax_3d, label='Signal \u00fcber Hintergrund [ADU]')
+
+        # Gleiche x/y-Skalierung erzwingen, sonst verzerrt matplotlib die Achsen
+        # unabhaengig voneinander und der Apertur-Kreis wirkt faelschlich oval/versetzt.
+        # Die z-Achse bekommt eine feste, rein optische Boxhoehe (keine ADU-Werte!),
+        # da set_box_aspect nur die Seitenverhaeltnisse der Box vorgibt.
+        dx = float(xx.max() - xx.min())
+        dy = float(yy.max() - yy.min())
+        ax_3d.set_box_aspect((dx, dy, 0.6 * max(dx, dy)))
+
+        def _surface_z_at(px, py):
+            ix = int(np.clip(round(px) - xmin, 0, z_data.shape[1] - 1))
+            iy = int(np.clip(round(py) - ymin, 0, z_data.shape[0] - 1))
+            return float(z_data[iy, ix])
+
+        fwhm_fit = None
+        if fit is not None:
+            amp, fwhm_fit, _ = fit
+            sigma = fwhm_fit / 2.354820045
+            # Die azimutal gemittelte Profil-Amplitude unterschaetzt oft den tatsaechlichen
+            # (scharfen) Peak. Fuer eine sichtbare Ueberlagerung wird die Modellhoehe auf den
+            # real beobachteten Peak skaliert; Breite/Form (Sigma) kommt weiterhin aus dem Fit.
+            amp_display = max(amp, _surface_z_at(x_psf, y_psf))
+            z_model = amp_display * np.exp(-(((xx - x_psf) ** 2 + (yy - y_psf) ** 2) / (2.0 * sigma ** 2)))
+            # Grober Gitterabstand, damit das Drahtgitter die darunterliegende
+            # Datenoberflaeche nicht vollstaendig verdeckt (nur Kontur, kein Vollflaechen-Netz).
+            model_stride = max(2, cut.shape[0] // 14)
+            ax_3d.plot_wireframe(xx, yy, z_model, color='red', linewidth=1.1, alpha=0.85,
+                                rstride=model_stride, cstride=model_stride, zorder=5)
+        else:
+            ax_3d.text2D(0.02, 0.90, 'Kein stabiler PSF-Fit\n(vermutlich durch Sternhaeufung gestoert)',
+                        transform=ax_3d.transAxes, fontsize=8, color='red',
+                        bbox=dict(boxstyle='round', facecolor='white', alpha=0.85, edgecolor='red'))
+
+        # Apertur-Radius um das tatsaechliche Apertur-Zentrum (nicht den Mittelwert)
+        theta = np.linspace(0, 2 * np.pi, 100)
+        xc = x_ap + aperture_radius * np.cos(theta)
+        yc = y_ap + aperture_radius * np.sin(theta)
+        floor_z = float(np.nanmin(z_data))
+        zc = np.full_like(xc, floor_z)
+        ax_3d.plot(xc, yc, zc, color='orange', linewidth=2.5, zorder=6)
+
+        # Zentren beider Methoden markieren, inkl. Lotlinie zur Oberflaeche,
+        # damit eine Positionsabweichung (z.B. durch einen Nachbarstern) sichtbar wird
+        z_ap_top = _surface_z_at(x_ap, y_ap)
+        z_psf_top = _surface_z_at(x_psf, y_psf)
+        ax_3d.plot([x_ap, x_ap], [y_ap, y_ap], [floor_z, z_ap_top], color='orange', linestyle='--', linewidth=1.5, zorder=6)
+        ax_3d.scatter([x_ap], [y_ap], [z_ap_top], color='orange', s=90, marker='o',
+                     edgecolor='black', linewidth=1.2, depthshade=False, zorder=10)
+        ax_3d.plot([x_psf, x_psf], [y_psf, y_psf], [floor_z, z_psf_top], color='red', linestyle='--', linewidth=1.5, zorder=6)
+        ax_3d.scatter([x_psf], [y_psf], [z_psf_top], color='red', s=90, marker='^',
+                     edgecolor='black', linewidth=1.2, depthshade=False, zorder=11)
+
+        psf_label = 'PSF-Gau\u00df-Fit' + (f' (FWHM={fwhm_fit:.2f}px)' if fwhm_fit is not None else ' (kein stabiler Fit)')
+        legend_elements = [
+            Line2D([0], [0], color='red', lw=2, label=psf_label),
+            Line2D([0], [0], color='orange', lw=2, label=f'Apertur-Radius ({aperture_radius:.1f}px)'),
+            Line2D([0], [0], marker='o', color='orange', linestyle='None', markeredgecolor='black', label='Apertur-Zentrum'),
+            Line2D([0], [0], marker='^', color='red', linestyle='None', markeredgecolor='black', label='PSF-Zentrum'),
+        ]
+        ax_3d.legend(handles=legend_elements, loc='upper left', fontsize=7)
+
+        ax_3d.set_xlabel('x [Pixel]')
+        ax_3d.set_ylabel('y [Pixel]')
+        ax_3d.set_zlabel('Signal \u00fcber Hintergrund [ADU]')
+        ax_3d.set_title(
+            f'Stern #{star_number}\n'
+            f'\u0394mag={delta:+.3f} (aperture={mag_ap:.3f}, psf={mag_psf:.3f}), '
+            f'Zentren-Abstand={center_sep:.1f}px',
+            fontsize=9
+        )
+
+    _draw_star_3d_panel(max_entry, 1)
+
+    def _on_star_click(event):
+        # Klick auf einen nummerierten Stern im linken Bild aktualisiert den 3D-Plot
+        # (funktioniert nur mit interaktivem matplotlib-Backend, z.B. beim direkten Anzeigen).
+        if event.inaxes is not ax_img or event.xdata is None or event.ydata is None:
+            return
+        click_xy = np.array([event.xdata, event.ydata])
+        positions = np.array([[e[0], e[1]] for e in entries])
+        idx = int(np.argmin(np.linalg.norm(positions - click_xy, axis=1)))
+        print(f"  -> Stern #{idx + 1} angeklickt (x={entries[idx][0]:.1f}, y={entries[idx][1]:.1f}), "
+              f"\u0394mag={entries[idx][4]:+.3f}")
+        _draw_star_3d_panel(entries[idx], idx + 1)
+        fig.canvas.draw_idle()
+
+    fig.canvas.mpl_connect('button_press_event', _on_star_click)
+    print("  Tipp: Bei interaktivem Anzeigefenster kannst du im linken Bild auf einen "
+          "nummerierten Stern klicken, um den 3D-Plot dafuer zu erzeugen.")
+
+    fig.suptitle('Extraktionsmethoden-Vergleich: Apertur vs PSF', fontsize=14)
+    plt.tight_layout()
+    if save:
+        try:
+            fig.savefig(save, dpi=150)
+            print(f"Extraktionsmethoden-Vergleich gespeichert: {save}")
+        except Exception as e:
+            print(f"Fehler beim Speichern des Extraktionsmethoden-Vergleichs: {e}", file=sys.stderr)
+    plt.show()
+
+
+def plot_aperture_radius_comparison(radii, delta_lists, save: Optional[str] = None) -> None:
+    """Vergleiche Delta(mag) = psf - aperture fuer mehrere Apertur-Radien (Boxplot + Streupunkte).
+
+    radii: Liste der verwendeten Apertur-Radien in Pixel.
+    delta_lists: Liste von Listen mit Delta(mag)-Werten, eine Liste je Radius.
+    """
+    valid = [(r, d) for r, d in zip(radii, delta_lists) if d]
+    if not valid:
+        print("Keine Daten fuer den Apertur-Radius-Vergleich verfuegbar.")
+        return
+
+    radii_valid = [r for r, _ in valid]
+    delta_lists_valid = [np.asarray(d, dtype=float) for _, d in valid]
+
+    print("\n=== Apertur-Radius-Vergleich: Abweichung zur PSF-Helligkeit ===")
+    for r, deltas in zip(radii_valid, delta_lists_valid):
+        rms = float(np.sqrt(np.mean(deltas**2)))
+        mean_delta = float(np.mean(deltas))
+        std_delta = float(np.std(deltas))
+        print(f"  Radius={r:.1f}px: n={len(deltas)}, RMS={rms:.4f} mag, "
+              f"Mittel={mean_delta:+.4f} mag, Std={std_delta:.4f} mag")
+
+    fig, ax = plt.subplots(figsize=(max(9.0, 1.4 * len(radii_valid) + 3.0), 6))
+    labels = [f'{r:.1f}px' for r in radii_valid]
+    bp = ax.boxplot(delta_lists_valid, tick_labels=labels, showmeans=True, patch_artist=True)
+
+    colors = plt.get_cmap('viridis')(np.linspace(0.25, 0.8, len(radii_valid)))
+    for patch, color in zip(bp['boxes'], colors):
+        patch.set_facecolor(color)
+        patch.set_alpha(0.6)
+
+    rng = np.random.default_rng(42)
+    for i, deltas in enumerate(delta_lists_valid, start=1):
+        jitter = rng.normal(0, 0.05, size=len(deltas))
+        ax.scatter(np.full(len(deltas), i) + jitter, deltas, s=14, color='black', alpha=0.35, zorder=3)
+
+    ax.axhline(0, color='gray', linewidth=1.0)
+    ax.set_xlabel('Apertur-Radius')
+    ax.set_ylabel('\u0394mag (psf - aperture)')
+    ax.set_title('Einfluss des Apertur-Radius auf die Abweichung zur PSF-Helligkeit')
+    ax.grid(alpha=0.3, axis='y')
+
+    plt.tight_layout()
+    if save:
+        try:
+            fig.savefig(save, dpi=150)
+            print(f"Apertur-Radius-Vergleich gespeichert: {save}")
+        except Exception as e:
+            print(f"Fehler beim Speichern des Apertur-Radius-Vergleichs: {e}", file=sys.stderr)
+    plt.show()
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(description='Zeige zwei FITS-Dateien aus einem Ordner an und führe Aperturphotometrie durch')
+    parser.add_argument('folder', help='Pfad zum Ordner mit FITS-Dateien')
+    parser.add_argument('--indices', '-i', type=int, nargs='*', help='Index(e) der anzuzeigenden Dateien (0-basiert). Wenn nicht gesetzt, werden die ersten zwei verwendet.')
+    parser.add_argument('--save', '-s', help='Optional: Pfad (z.B. out.png) um die erzeugte Abbildung der Frames zu speichern')
+    parser.add_argument('--save-cm', help='Optional: Pfad (z.B. cm.png) um das Color-Magnitude-Diagramm zu speichern')
+    parser.add_argument('--plot-stellar-profiles', action='store_true',
+                        help='Zeige einen Plot mit radial gemittelten Sternprofilen (hell/mittel/dunkel) und PSF-Fit.')
+    parser.add_argument('--save-stellar-profiles', type=str, default=None,
+                        help='Optional: Pfad (z.B. stellar_profiles.png) zum Speichern des Profil/PSF-Plots.')
+    parser.add_argument('--compare-cmd-methods', action='store_true',
+                        help='Vergleiche CMDs von aperture und psf in einem gemeinsamen Plot mit unterschiedlichen Farben.')
+    parser.add_argument('--save-cmd-compare', type=str, default=None,
+                        help='Optional: Pfad (z.B. cmd_compare.png) zum Speichern des CMD-Methodenvergleichs.')
+    parser.add_argument('--compare-extraction-methods', action='store_true',
+                        help='Statistischer Vergleich der Helligkeitsextraktion (Apertur vs PSF) im V-Bild; '
+                             'Sterne werden im Bild nummeriert markiert (Nummer 1 = groesste Abweichung).')
+    parser.add_argument('--save-extraction-compare', type=str, default=None,
+                        help='Optional: Pfad (z.B. extraction_compare.png) zum Speichern des Extraktionsmethoden-Vergleichs.')
+    parser.add_argument('--compare-aperture-radii', type=float, nargs='+', default=None, metavar='R',
+                        help='Extrahiere Helligkeiten mit beliebig vielen Apertur-Radien (Pixel, mind. 1) und '
+                             'vergleiche die Abweichung zur PSF-Helligkeit je Radius (Boxplot). '
+                             'Erfordert --compare-extraction-methods.')
+    parser.add_argument('--save-aperture-radii-compare', type=str, default=None,
+                        help='Optional: Pfad (z.B. aperture_radii_compare.png) zum Speichern des Apertur-Radius-Vergleichs.')
+    parser.add_argument('--verbose', '-v', action='store_true', help='Mehr Ausgaben')
+    parser.add_argument('--aperture', type=float, default=None, 
+                       help='Aperturradius in Pixel. Wenn nicht angegeben: automatisch aus dem hellsten Stern im Cluster-Radius.')
+    parser.add_argument('--aperture-per-star', action='store_true',
+                       help='Passe Apertur/Annulus pro Stern individuell aus dem lokalen Sternprofil an (nur aperture-Methode).')
+    parser.add_argument('--fwhm', type=float, default=3.0, help='FWHM in Pixel für Quellenfindung (Standard 3.0)')
+    parser.add_argument('--detect-fwhm-scale', type=float, default=0.85,
+                        help='Skalierung des FWHM nur für die Peak-Erkennung. Kleiner trennt nahe Sterne besser (Standard 0.85).')
+    parser.add_argument('--threshold', type=float, default=5.0, help='Schwelle in sigma für Quellenfindung (Standard 5.0)')
+    parser.add_argument('--photometry-method', type=str, choices=['aperture', 'psf'], default='aperture',
+                        help='Photometrie-Methode: aperture (Standard) oder psf (besser für dichte Sternfelder)')
+    parser.add_argument('--maxsep', type=float, default=5.0, help='Maximale Trennung in Pixel zum Matchen (Standard 5.0)')
+    parser.add_argument('--filters', nargs=2, default=['B', 'V'], help='Labels der beiden Bilder (z.B. B V). Erstes Bild -> erstes Label.')
+    parser.add_argument('--force-filters', action='store_true',
+                        help='Erzwinge --filters auch wenn FITS-Header Filter-Info haben (überschreibt Header)')
+    parser.add_argument('--cluster-radius', type=float, default=None, 
+                        help='Radius in Pixel um das Zentrum für Sternhaufen-Filterung. Standard: 40%% der y-Bildgröße. 0 = deaktiviert.')
+    parser.add_argument('--cluster-center', type=float, nargs=2, default=None, metavar=('X', 'Y'),
+                        help='Zentrum (x, y) in Pixel für Sternhaufen-Filterung. Standard: Bildmitte.')
+    parser.add_argument('--annulus-radii', type=float, nargs=2, default=None, metavar=('R_INNER', 'R_OUTER'),
+                        help=('Nur Sterne in einem Ring (Annulus) zwischen innerem (R_INNER) und äußerem '
+                              '(R_OUTER) Radius in Pixel um das Zentrum berücksichtigen. '
+                              'Überschreibt --cluster-radius.'))
+    parser.add_argument('--calibrate', action='store_true',
+                        help='Aktiviere interaktive Kalibrierung mit Referenzstern')
+    parser.add_argument('--calibrate-file', type=str, default=None,
+                        help='Pfad zur Kalibrierungsdatei (zum Speichern bei --calibrate oder Laden)')
+    parser.add_argument('--fit-isochrone', action='store_true',
+                        help='Bestimme Entfernung und Alter durch Isochronen-Anpassung (benötigt --calibrate)')
+    parser.add_argument('--ebv', type=float, default=None,
+                        help='Rötung E(B-V) in mag für Isochronen-Anpassung (wird abgefragt falls nicht angegeben)')
+    parser.add_argument('--age-range', type=float, nargs=2, default=[6.8, 7.6],
+                        help='Altersbereich für Isochronen-Anpassung als log(age/Jahre) (Standard: 6.8 7.6 = 6-40 Myr)')
+    parser.add_argument('--age', type=float, default=None,
+                        help='Fixiertes Alter in Millionen Jahren (z.B. 10.6 für NGC869, 25 für M36). Wenn gesetzt, wird nur die Entfernung bestimmt.')
+    parser.add_argument('--outlier-sigma', type=float, default=3.0,
+                        help='Sigma-Schwelle für Ausreißer-Filterung in B-V Farbe (Standard: 3.0). Höhere Werte = weniger Filterung.')
+    args = parser.parse_args(argv)
+
+    if args.detect_fwhm_scale <= 0:
+        print("--detect-fwhm-scale muss > 0 sein.", file=sys.stderr)
+        return 2
+
+    folder = args.folder
+    if not os.path.isdir(folder):
+        print(f"Ordner existiert nicht: {folder}", file=sys.stderr)
+        return 2
+    
+    # Bestimme Ausgabepfade: Falls relative Pfade oder nur Dateinamen angegeben,
+    # speichere im FITS-Ordner. Absolute Pfade bleiben unverändert.
+    save_images_path = None
+    if args.save:
+        if os.path.isabs(args.save):
+            save_images_path = args.save
+        else:
+            save_images_path = get_output_path(folder, args.save)
+    
+    save_cmd_path = None
+    if args.save_cm:
+        if os.path.isabs(args.save_cm):
+            save_cmd_path = args.save_cm
+        else:
+            save_cmd_path = get_output_path(folder, args.save_cm)
+
+    save_stellar_profiles_path = None
+    if args.save_stellar_profiles:
+        if os.path.isabs(args.save_stellar_profiles):
+            save_stellar_profiles_path = args.save_stellar_profiles
+        else:
+            save_stellar_profiles_path = get_output_path(folder, args.save_stellar_profiles)
+
+    save_cmd_compare_path = None
+    if args.save_cmd_compare:
+        if os.path.isabs(args.save_cmd_compare):
+            save_cmd_compare_path = args.save_cmd_compare
+        else:
+            save_cmd_compare_path = get_output_path(folder, args.save_cmd_compare)
+
+    save_extraction_compare_path = None
+    if args.save_extraction_compare:
+        if os.path.isabs(args.save_extraction_compare):
+            save_extraction_compare_path = args.save_extraction_compare
+        else:
+            save_extraction_compare_path = get_output_path(folder, args.save_extraction_compare)
+
+    save_aperture_radii_compare_path = None
+    if args.save_aperture_radii_compare:
+        if os.path.isabs(args.save_aperture_radii_compare):
+            save_aperture_radii_compare_path = args.save_aperture_radii_compare
+        else:
+            save_aperture_radii_compare_path = get_output_path(folder, args.save_aperture_radii_compare)
+    
+    calibrate_file_path = None
+    if args.calibrate_file:
+        if os.path.isabs(args.calibrate_file):
+            calibrate_file_path = args.calibrate_file
+        else:
+            calibrate_file_path = get_output_path(folder, args.calibrate_file)
+    elif args.calibrate:
+        # Kein expliziter Pfad angegeben, verwende Standard im FITS-Ordner
+        calibrate_file_path = get_output_path(folder, 'calib.txt')
+    
+    if args.verbose:
+        print(f"Erkennungs-FWHM: {args.detect_fwhm_scale:.2f} × {args.fwhm:.2f} = {args.detect_fwhm_scale * args.fwhm:.2f} Pixel")
+        if save_images_path:
+            print(f"Bilder werden gespeichert in: {save_images_path}")
+        if save_cmd_path:
+            print(f"CMD wird gespeichert in: {save_cmd_path}")
+        if save_stellar_profiles_path:
+            print(f"Sternprofil/PSF-Plot wird gespeichert in: {save_stellar_profiles_path}")
+        if save_cmd_compare_path:
+            print(f"CMD-Methodenvergleich wird gespeichert in: {save_cmd_compare_path}")
+        if save_extraction_compare_path:
+            print(f"Extraktionsmethoden-Vergleich wird gespeichert in: {save_extraction_compare_path}")
+        if save_aperture_radii_compare_path:
+            print(f"Apertur-Radius-Vergleich wird gespeichert in: {save_aperture_radii_compare_path}")
+        if calibrate_file_path:
+            print(f"Kalibrierungsdatei: {calibrate_file_path}")
+
+    files = find_fits_files(folder)
+    if args.verbose:
+        print(f"Gefundene FITS-Dateien ({len(files)}):")
+        for i, f in enumerate(files):
+            print(f"  {i}: {f}")
+
+    if len(files) < 2 and not args.indices:
+        print(f"Es wurden nur {len(files)} FITS-Datei(en) gefunden. Mindestens 2 werden erwartet.", file=sys.stderr)
+        if len(files) == 0:
+            return 1
+
+    if args.indices:
+        selected = []
+        for idx in args.indices:
+            if idx < 0 or idx >= len(files):
+                print(f"Index {idx} außerhalb der gefundenen Dateien.", file=sys.stderr)
+                return 1
+            selected.append(files[idx])
+    else:
+        if len(files) == 0:
+            print("Keine FITS-Dateien gefunden.", file=sys.stderr)
+            return 1
+        # Standard: die ersten zwei
+        selected = files[:2]
+        if len(files) > 2 and args.verbose:
+            print(f"Mehr als 2 FITS-Dateien gefunden; zeige die ersten beiden: {os.path.basename(selected[0])}, {os.path.basename(selected[1])}")
+
+    # Lade Bilder
+    images = []
+    datas = []
+    headers = []
+    for p in selected:
+        try:
+            data, header = load_fits_image(p)
+        except Exception as e:
+            print(str(e), file=sys.stderr)
+            data, header = None, None
+        images.append((data, header))
+        if data is not None:
+            datas.append(data)
+        else:
+            print(f"Überspringe Photometrie für {p}: keine gültigen Daten")
+            datas.append(None)
+        headers.append(header)
+
+    # Bestimme Zentrum und Radius für Sternhaufen-Filterung (vor der Verwendung!)
+    cluster_center = None
+    cluster_radius = None
+    
+    # Berechne cluster_radius und cluster_center basierend auf den Argumenten
+    if args.cluster_radius is not None and args.cluster_radius > 0:
+        cluster_radius = args.cluster_radius
+    elif args.cluster_radius != 0:  # None oder nicht explizit 0
+        # Standard: 40% der y-Bildgröße
+        if datas[0] is not None:
+            cluster_radius = datas[0].shape[0] * 0.4
+        elif datas[1] is not None:
+            cluster_radius = datas[1].shape[0] * 0.4
+    
+    if cluster_radius is not None and cluster_radius > 0:
+        if args.cluster_center is not None:
+            cluster_center = tuple(args.cluster_center)
+        else:
+            # Standard: Bildmitte
+            if datas[0] is not None:
+                cluster_center = (datas[0].shape[1] / 2.0, datas[0].shape[0] / 2.0)
+            elif datas[1] is not None:
+                cluster_center = (datas[1].shape[1] / 2.0, datas[1].shape[0] / 2.0)
+        
+        if args.verbose and cluster_center is not None:
+            print(f"Sternhaufen-Filterung: Radius={cluster_radius:.1f} Pixel, Zentrum=({cluster_center[0]:.1f}, {cluster_center[1]:.1f})")
+    
+    # Annulus-Filterung verarbeiten (überschreibt ggf. cluster_radius)
+    annulus_inner = None
+    if args.annulus_radii is not None:
+        r_inner, r_outer = args.annulus_radii
+        if r_inner < 0 or r_outer <= 0:
+            print("FEHLER: Annulus-Radien müssen positiv sein.", file=sys.stderr)
+            return 1
+        if r_inner >= r_outer:
+            print(f"FEHLER: Innerer Radius ({r_inner:.1f}) muss kleiner als äußerer Radius ({r_outer:.1f}) sein.", file=sys.stderr)
+            return 1
+        annulus_inner = r_inner
+        cluster_radius = r_outer
+        # Stelle sicher, dass cluster_center gesetzt ist
+        if cluster_center is None:
+            if datas[0] is not None:
+                cluster_center = (datas[0].shape[1] / 2.0, datas[0].shape[0] / 2.0)
+            elif datas[1] is not None:
+                cluster_center = (datas[1].shape[1] / 2.0, datas[1].shape[0] / 2.0)
+        print(f"Annulus-Filterung: R_inner={annulus_inner:.1f}, R_outer={cluster_radius:.1f} Pixel, "
+              f"Zentrum=({cluster_center[0]:.1f}, {cluster_center[1]:.1f})")
+    
+    # Photometrie durchführen
+    try:
+        method = args.photometry_method if hasattr(args, 'photometry_method') else 'aperture'
+        if args.verbose:
+            print(f"Verwende {method}-Photometrie...")
+        if args.aperture_per_star and method != 'aperture':
+            print("Hinweis: --aperture-per-star wirkt nur mit --photometry-method aperture und wird hier ignoriert.")
+        if args.aperture_per_star and args.aperture is not None:
+            print("Hinweis: --aperture ist gesetzt; --aperture-per-star nutzt diesen Wert als Basis und skaliert pro Stern.")
+        
+        result1 = detect_and_photometry_wrapper(datas[0], method=method, fwhm=args.fwhm, 
+                                               threshold_sigma=args.threshold, 
+                                               aperture_radius=args.aperture,
+                                               cluster_center=cluster_center,
+                                               cluster_radius=cluster_radius,
+                                               aperture_per_star=args.aperture_per_star,
+                                               detect_fwhm_scale=args.detect_fwhm_scale) if datas[0] is not None else (None, None)
+        result2 = detect_and_photometry_wrapper(datas[1], method=method, fwhm=args.fwhm, 
+                                               threshold_sigma=args.threshold, 
+                                               aperture_radius=args.aperture,
+                                               cluster_center=cluster_center,
+                                               cluster_radius=cluster_radius,
+                                               aperture_per_star=args.aperture_per_star,
+                                               detect_fwhm_scale=args.detect_fwhm_scale) if datas[1] is not None else (None, None)
+        
+        # Entpacke Ergebnisse
+        tab1, aperture_used_1 = result1
+        tab2, aperture_used_2 = result2
+        
+        # Verwende den ersten nicht-None Aperturwert für die Plots
+        aperture_for_plot = aperture_used_1 if aperture_used_1 is not None else aperture_used_2
+        
+        if args.verbose and (tab1 is not None or tab2 is not None):
+            n1 = len(tab1) if tab1 is not None else 0
+            n2 = len(tab2) if tab2 is not None else 0
+            print(f"Gefundene Quellen: {n1} im ersten, {n2} im zweiten Bild")
+    except Exception as e:
+        print(f"Fehler bei der Photometrie: {e}", file=sys.stderr)
+        return 1
+    
+    if tab1 is None or tab2 is None:
+        print("In mindestens einem Bild wurden keine Quellen gefunden.")
+        return 1
+
+    if args.plot_stellar_profiles or args.save_stellar_profiles:
+        # Nutze das erste Bild (typisch B-Frame) für repräsentative Sternprofile.
+        plot_star_profile_psf_samples(datas[0], tab1, fwhm=args.fwhm, save=save_stellar_profiles_path)
+
+    # Führe Matching durch um den Offset zu bekommen
+    matched, image_offset = match_sources(tab1, tab2, max_sep=args.maxsep, 
+                           filter_radius=cluster_radius, center=cluster_center,
+                           annulus_inner=annulus_inner)
+    if args.verbose:
+        print(f"Gefundene Matches: {len(matched)}")
+
+    # Zeige die Frames mit Aperturen (NACH Matching, damit Offset bekannt ist)
+    # Übergebe matched_indices damit nur gematchte Sterne angezeigt werden
+    plot_images(images, selected, phot_tables=[tab1, tab2], aperture_radius=aperture_for_plot, 
+                cluster_radius=cluster_radius, cluster_center=cluster_center, 
+                image_offset=image_offset, matched_indices=matched, annulus_inner=annulus_inner,
+                save=save_images_path)
+
+    # Bestimme Filter aus FITS-Headern
+    filter1_from_header = get_filter_from_header(headers[0]) if len(headers) > 0 else None
+    filter2_from_header = get_filter_from_header(headers[1]) if len(headers) > 1 else None
+    
+    print(f"\n=== Filter-Zuordnung ===")
+    print(f"Erstes Bild: {os.path.basename(selected[0])}")
+    if filter1_from_header:
+        print(f"  FITS-Header: FILTER = '{filter1_from_header}'")
+    else:
+        print(f"  FITS-Header: Kein Filter-Keyword gefunden")
+    
+    print(f"Zweites Bild: {os.path.basename(selected[1])}")
+    if filter2_from_header:
+        print(f"  FITS-Header: FILTER = '{filter2_from_header}'")
+    else:
+        print(f"  FITS-Header: Kein Filter-Keyword gefunden")
+    
+    # Bestimme Filter-Zuordnung
+    # Priorität 1: --force-filters überschreibt alles
+    # Priorität 2: FITS-Header
+    # Priorität 3: Command-line --filters Argumente
+    
+    filters_swapped = False  # Track ob wir vertauscht haben
+    
+    if args.force_filters:
+        # Erzwinge --filters auch wenn Header vorhanden
+        label1, label2 = args.filters
+        print(f"\n⚠ --force-filters aktiv: Ignoriere FITS-Header")
+        print(f"Verwende --filters Argumente: '{label1}' und '{label2}'")
+        
+        if label1.upper() == 'B' and label2.upper() == 'V':
+            tabB = tab1
+            tabV = tab2
+            print(f"  → Zuordnung: Bild 1 = B, Bild 2 = V")
+        elif label1.upper() == 'V' and label2.upper() == 'B':
+            tabB = tab2
+            tabV = tab1
+            filters_swapped = True
+            print(f"  → Zuordnung: Bild 1 = V, Bild 2 = B (vertauscht)")
+        else:
+            print(f"  Unklare Labels. Verwende Flux-basierte Heuristik...")
+            tabB, tabV = assign_filters_by_flux(tab1, tab2)
+    elif filter1_from_header and filter2_from_header:
+        # Verwende Header-Informationen
+        if filter1_from_header == 'B' and filter2_from_header == 'V':
+            tabB = tab1
+            tabV = tab2
+            print(f"\n✓ Filter aus FITS-Header: Bild 1 = B, Bild 2 = V")
+        elif filter1_from_header == 'V' and filter2_from_header == 'B':
+            tabB = tab2
+            tabV = tab1
+            filters_swapped = True
+            print(f"\n✓ Filter aus FITS-Header: Bild 1 = V, Bild 2 = B")
+            print(f"  → Vertausche Zuordnung: tabB = Bild 2, tabV = Bild 1")
+        else:
+            print(f"\n⚠ Unerwartete Filter in Header: '{filter1_from_header}' und '{filter2_from_header}'")
+            print(f"  Verwende Flux-basierte Heuristik...")
+            tabB, tabV = assign_filters_by_flux(tab1, tab2)
+    else:
+        # Priorität 2: Command-line Argumente
+        label1, label2 = args.filters
+        print(f"\nKeine Filter-Info in FITS-Headern.")
+        print(f"Verwende --filters Argumente: '{label1}' und '{label2}'")
+        
+        if label1.upper() == 'B' and label2.upper() == 'V':
+            tabB = tab1
+            tabV = tab2
+            print(f"  → Zuordnung: Bild 1 = B, Bild 2 = V")
+        elif label1.upper() == 'V' and label2.upper() == 'B':
+            tabB = tab2
+            tabV = tab1
+            filters_swapped = True
+            print(f"  → Zuordnung: Bild 1 = V, Bild 2 = B (vertauscht)")
+        else:
+            print(f"  Unklare Labels. Verwende Flux-basierte Heuristik...")
+            tabB, tabV = assign_filters_by_flux(tab1, tab2)
+    
+    # WICHTIG: Wenn Filter vertauscht wurden, müssen auch die matched Indizes vertauscht werden!
+    # matched enthält (index_in_tab1, index_in_tab2), aber jetzt ist tabB=tab2 und tabV=tab1
+    # Also müssen wir zu (index_in_tab2, index_in_tab1) ändern = (index_in_tabB, index_in_tabV)
+    if filters_swapped:
+        matched = [(iV, iB) for (iB, iV) in matched]
+        print(f"  → matched Indizes vertauscht: jetzt (index_in_tabB, index_in_tabV)")
+    
+    print()  # Leerzeile
+
+    if args.compare_extraction_methods:
+        # Nur das V-Bild wird benoetigt: bestimme die zugehoerigen Rohdaten/Pfad
+        data_v = datas[0] if filters_swapped else datas[1]
+        path_v = selected[0] if filters_swapped else selected[1]
+
+        if data_v is None:
+            print("Extraktionsmethoden-Vergleich uebersprungen: keine gueltigen Daten fuer das V-Bild.")
+        else:
+            other_method = 'psf' if method == 'aperture' else 'aperture'
+            try:
+                other_result = detect_and_photometry_wrapper(
+                    data_v, method=other_method, fwhm=args.fwhm,
+                    threshold_sigma=args.threshold, aperture_radius=args.aperture,
+                    cluster_center=cluster_center, cluster_radius=cluster_radius,
+                    aperture_per_star=args.aperture_per_star,
+                    detect_fwhm_scale=args.detect_fwhm_scale
+                )
+                tab_other, _ = other_result
+            except Exception as e:
+                print(f"  WARNUNG: {other_method}-Photometrie fuer Extraktionsmethoden-Vergleich fehlgeschlagen: {e}")
+                tab_other = None
+
+            if tab_other is None:
+                print("Extraktionsmethoden-Vergleich uebersprungen: zweite Photometrie-Methode lieferte keine Daten.")
+            else:
+                tab_aperture = tabV if method == 'aperture' else tab_other
+                tab_psf = tab_other if method == 'aperture' else tabV
+
+                aperture_radius_for_plot = aperture_for_plot if aperture_for_plot else 3.0 * args.fwhm
+                plot_extraction_method_comparison_combined(
+                    data_v, path_v, tab_aperture, tab_psf,
+                    max_sep=args.maxsep,
+                    cluster_center=cluster_center, cluster_radius=cluster_radius,
+                    annulus_inner=annulus_inner,
+                    aperture_radius=aperture_radius_for_plot, fwhm=args.fwhm,
+                    save=save_extraction_compare_path
+                )
+
+                if args.compare_aperture_radii:
+                    radii = args.compare_aperture_radii
+                    delta_lists = []
+                    for r in radii:
+                        try:
+                            tab_r, _ = detect_and_photometry_wrapper(
+                                data_v, method='aperture', fwhm=args.fwhm,
+                                threshold_sigma=args.threshold, aperture_radius=r,
+                                cluster_center=cluster_center, cluster_radius=cluster_radius,
+                                aperture_per_star=False, detect_fwhm_scale=args.detect_fwhm_scale
+                            )
+                        except Exception as e:
+                            print(f"  WARNUNG: Apertur-Photometrie mit Radius {r:.1f}px fehlgeschlagen: {e}")
+                            delta_lists.append([])
+                            continue
+                        if tab_r is None:
+                            print(f"  WARNUNG: Keine Quellen fuer Apertur-Radius {r:.1f}px gefunden.")
+                            delta_lists.append([])
+                            continue
+                        entries_r = _match_aperture_psf_entries(
+                            tab_r, tab_psf, max_sep=args.maxsep,
+                            cluster_center=cluster_center, cluster_radius=cluster_radius,
+                            annulus_inner=annulus_inner
+                        )
+                        delta_lists.append([e[4] for e in entries_r])
+
+                    plot_aperture_radius_comparison(radii, delta_lists, save=save_aperture_radii_compare_path)
+
+    if len(matched) > 0:
+        # Zeige Anzahl der Gesamtquellen für Kontext
+        n_total_B = len(tab1) if tab1 is not None else 0
+        n_total_V = len(tab2) if tab2 is not None else 0
+
+        if args.compare_cmd_methods and not (args.calibrate or args.calibrate_file):
+            print("\n=== CMD-Vergleich: aperture vs psf ===")
+            comparison_data = {}
+
+            # Bereits berechnete Methode direkt verwenden
+            comparison_data[method] = compute_instrumental_cmd_points(
+                matched, tabB, tabV, outlier_sigma=args.outlier_sigma
+            )
+
+            for compare_method in ('aperture', 'psf'):
+                if compare_method in comparison_data:
+                    continue
+
+                try:
+                    compare_result1 = detect_and_photometry_wrapper(
+                        datas[0], method=compare_method, fwhm=args.fwhm,
+                        threshold_sigma=args.threshold, aperture_radius=args.aperture,
+                        cluster_center=cluster_center, cluster_radius=cluster_radius,
+                        aperture_per_star=args.aperture_per_star,
+                        detect_fwhm_scale=args.detect_fwhm_scale
+                    ) if datas[0] is not None else (None, None)
+                    compare_result2 = detect_and_photometry_wrapper(
+                        datas[1], method=compare_method, fwhm=args.fwhm,
+                        threshold_sigma=args.threshold, aperture_radius=args.aperture,
+                        cluster_center=cluster_center, cluster_radius=cluster_radius,
+                        aperture_per_star=args.aperture_per_star,
+                        detect_fwhm_scale=args.detect_fwhm_scale
+                    ) if datas[1] is not None else (None, None)
+                except Exception as e:
+                    print(f"  WARNUNG: {compare_method}-Photometrie fehlgeschlagen: {e}")
+                    comparison_data[compare_method] = None
+                    continue
+
+                compare_tab1, _ = compare_result1
+                compare_tab2, _ = compare_result2
+                if compare_tab1 is None or compare_tab2 is None:
+                    print(f"  WARNUNG: Keine Daten fuer {compare_method}-Photometrie verfuegbar.")
+                    comparison_data[compare_method] = None
+                    continue
+
+                compare_matches, _ = match_sources(
+                    compare_tab1, compare_tab2, max_sep=args.maxsep,
+                    filter_radius=cluster_radius, center=cluster_center,
+                    annulus_inner=annulus_inner
+                )
+
+                if filters_swapped:
+                    compare_matches = [(iV, iB) for (iB, iV) in compare_matches]
+                    compare_tabB = compare_tab2
+                    compare_tabV = compare_tab1
+                else:
+                    compare_tabB = compare_tab1
+                    compare_tabV = compare_tab2
+
+                comparison_data[compare_method] = compute_instrumental_cmd_points(
+                    compare_matches, compare_tabB, compare_tabV,
+                    outlier_sigma=args.outlier_sigma
+                )
+
+            plot_cmd_method_comparison(
+                comparison_data.get('aperture'),
+                comparison_data.get('psf'),
+                selected,
+                save=save_cmd_compare_path,
+                calibrated=False,
+                dereddened=False
+            )
+        
+        # Kalibrierung mit Referenzstern falls gewünscht
+        calibrated_mags_B = None
+        calibrated_mags_V = None
+        calibrated_colors = None
+        
+        if args.calibrate or args.calibrate_file:
+            print("\n=== Referenzstern-Kalibrierung ===")
+            
+            # Lade Kalibrierung aus Datei falls angegeben und --calibrate nicht gesetzt
+            if args.calibrate_file and not args.calibrate:
+                ref_index_B, mag_B_true, mag_V_true, ref_x, ref_y = load_calibration(
+                    calibrate_file_path, [tab1, tab2], matched
+                )
+            else:
+                # Interaktive Auswahl
+                # Wenn Filter vertauscht wurden, müssen auch die Bilder vertauscht werden!
+                images_for_calib = [images[1], images[0]] if filters_swapped else images
+                ref_index_B, mag_B_true, mag_V_true, ref_x, ref_y = select_reference_star(
+                    images_for_calib, [tabB, tabV], matched, aperture_for_plot, calibrate_file_path, folder
+                )
+            
+            if ref_index_B is not None:
+                calibrated_mags_B, calibrated_mags_V, calibrated_colors, matched_calibrated = \
+                    calibrate_magnitudes(matched, tabB, tabV, ref_index_B, mag_B_true, mag_V_true)
+                
+                if calibrated_mags_B is not None:
+                    print(f"Kalibrierung erfolgreich! {len(calibrated_mags_B)} Sterne kalibriert.")
+                    
+                    # Speichere Photometrie-Tabelle
+                    # Hole Koordinaten der kalibrierten Sterne (aus tabB, da matched_calibrated auf tabB basiert)
+                    x_coords = []
+                    y_coords = []
+                    for idx_b, idx_v in matched_calibrated:
+                        x_coords.append(tabB['x'][idx_b])
+                        y_coords.append(tabB['y'][idx_b])
+                    
+                    phot_table_path = get_output_path(folder, 'photometry.txt')
+                    save_photometry_table(phot_table_path, calibrated_mags_V, calibrated_colors,
+                                        x_coords=np.array(x_coords), y_coords=np.array(y_coords))
+                    
+                    # Isochronen-Anpassung falls gewünscht
+                    if args.fit_isochrone:
+                        # Frage nach Rötung falls nicht angegeben
+                        ebv = args.ebv
+                        if ebv is None:
+                            try:
+                                ebv_input = input("\nRötung E(B-V) in mag (z.B. 0.05): ")
+                                ebv = float(ebv_input)
+                            except (ValueError, EOFError):
+                                print("Ungültige Eingabe. Überspringe Isochronen-Anpassung.")
+                                ebv = None
+                        
+                        if ebv is not None:
+                            result = fit_isochrone_distance_age(
+                                calibrated_colors, calibrated_mags_V, ebv,
+                                age_range=tuple(args.age_range),
+                                output_folder=folder,
+                                fixed_age_myr=args.age
+                            )
+                            
+                            if result is not None:
+                                # Entpacke Ergebnisse
+                                best_age = result['age_log']
+                                dm = result['dm']
+                                distance = result['distance_pc']
+                                chi2 = result['chi2']
+                                
+                                # Speichere Ergebnisse
+                                results_path = get_output_path(folder, 'cluster_parameters.txt')
+                                try:
+                                    with open(results_path, 'w') as f:
+                                        f.write("# Sternhaufen-Parameter\n")
+                                        f.write(f"# Erstellt am: {np.datetime64('now')}\n")
+                                        f.write("#\n")
+                                        f.write(f"E(B-V) = {ebv:.3f} mag\n")
+                                        f.write(f"log(Alter/Jahre) = {best_age:.2f}\n")
+                                        f.write(f"Alter = {10**best_age / 1e6:.1f} Millionen Jahre\n")
+                                        f.write(f"Entfernungsmodul = {dm:.2f} mag\n")
+                                        f.write(f"Entfernung = {distance:.0f} pc = {distance/1000:.2f} kpc\n")
+                                        f.write(f"Chi²/N = {chi2:.2f}\n")
+                                    print(f"Parameter gespeichert: {results_path}")
+                                except Exception as e:
+                                    print(f"WARNUNG: Konnte Parameter nicht speichern: {e}", file=sys.stderr)
+                                
+                                # Bereite Isochrone-Parameter für finales CMD vor
+                                # Wenn Isochrone vorhanden, zeige dereddened Daten
+                                isochrone_params = result
+                                # Dereddene die Daten für das finale CMD
+                                calibrated_colors_dered = calibrated_colors - ebv
+                                calibrated_mags_V_dered = calibrated_mags_V - 3.1 * ebv
+                                calibrated_mags_B_dered = calibrated_mags_B - 4.1 * ebv
+                            else:
+                                isochrone_params = None
+                                calibrated_colors_dered = calibrated_colors
+                                calibrated_mags_V_dered = calibrated_mags_V
+                                calibrated_mags_B_dered = calibrated_mags_B
+                        else:
+                            isochrone_params = None
+                            calibrated_colors_dered = calibrated_colors
+                            calibrated_mags_V_dered = calibrated_mags_V
+                            calibrated_mags_B_dered = calibrated_mags_B
+                    else:
+                        isochrone_params = None
+                        calibrated_colors_dered = calibrated_colors
+                        calibrated_mags_V_dered = calibrated_mags_V
+                        calibrated_mags_B_dered = calibrated_mags_B
+
+                    if args.compare_cmd_methods:
+                        print("\n=== CMD-Vergleich: aperture vs psf (kalibriert) ===")
+                        comparison_data = {}
+
+                        compare_ebv = None
+                        if isochrone_params is not None and 'ebv' in isochrone_params:
+                            compare_ebv = isochrone_params['ebv']
+                        elif args.ebv is not None:
+                            compare_ebv = args.ebv
+
+                        if compare_ebv is None:
+                            print("  Hinweis: Kein E(B-V) gesetzt, Vergleich wird kalibriert aber nicht dereddened geplottet.")
+
+                        ref_match_dist = args.maxsep * 3.0
+                        if aperture_for_plot is not None:
+                            ref_match_dist = max(ref_match_dist, aperture_for_plot * 2.0)
+
+                        for compare_method in ('aperture', 'psf'):
+                            try:
+                                compare_result1 = detect_and_photometry_wrapper(
+                                    datas[0], method=compare_method, fwhm=args.fwhm,
+                                    threshold_sigma=args.threshold, aperture_radius=args.aperture,
+                                    cluster_center=cluster_center, cluster_radius=cluster_radius,
+                                    aperture_per_star=args.aperture_per_star,
+                                    detect_fwhm_scale=args.detect_fwhm_scale
+                                ) if datas[0] is not None else (None, None)
+                                compare_result2 = detect_and_photometry_wrapper(
+                                    datas[1], method=compare_method, fwhm=args.fwhm,
+                                    threshold_sigma=args.threshold, aperture_radius=args.aperture,
+                                    cluster_center=cluster_center, cluster_radius=cluster_radius,
+                                    aperture_per_star=args.aperture_per_star,
+                                    detect_fwhm_scale=args.detect_fwhm_scale
+                                ) if datas[1] is not None else (None, None)
+                            except Exception as e:
+                                print(f"  WARNUNG: {compare_method}-Photometrie fehlgeschlagen: {e}")
+                                comparison_data[compare_method] = None
+                                continue
+
+                            compare_tab1, _ = compare_result1
+                            compare_tab2, _ = compare_result2
+                            if compare_tab1 is None or compare_tab2 is None:
+                                print(f"  WARNUNG: Keine Daten fuer {compare_method}-Photometrie verfuegbar.")
+                                comparison_data[compare_method] = None
+                                continue
+
+                            compare_matches, _ = match_sources(
+                                compare_tab1, compare_tab2, max_sep=args.maxsep,
+                                filter_radius=cluster_radius, center=cluster_center,
+                                annulus_inner=annulus_inner
+                            )
+
+                            if filters_swapped:
+                                compare_matches = [(iV, iB) for (iB, iV) in compare_matches]
+                                compare_tabB = compare_tab2
+                                compare_tabV = compare_tab1
+                            else:
+                                compare_tabB = compare_tab1
+                                compare_tabV = compare_tab2
+
+                            ref_idx_compare = find_nearest_source_index(
+                                compare_tabB, ref_x, ref_y, max_distance=ref_match_dist
+                            )
+                            if ref_idx_compare is None:
+                                print(f"  WARNUNG: Referenzstern fuer {compare_method} nicht gefunden.")
+                                comparison_data[compare_method] = None
+                                continue
+
+                            comparison_data[compare_method] = compute_calibrated_cmd_points(
+                                compare_matches,
+                                compare_tabB,
+                                compare_tabV,
+                                ref_idx_compare,
+                                mag_B_true,
+                                mag_V_true,
+                                outlier_sigma=args.outlier_sigma,
+                                ebv=compare_ebv
+                            )
+
+                        plot_cmd_method_comparison(
+                            comparison_data.get('aperture'),
+                            comparison_data.get('psf'),
+                            selected,
+                            save=save_cmd_compare_path,
+                            calibrated=True,
+                            dereddened=(compare_ebv is not None)
+                        )
+                    
+                    # Zeige kalibriertes Diagramm (dereddened wenn Isochrone vorhanden)
+                    plot_color_magnitude(matched_calibrated, tabB, tabV, selected, 
+                                       n_total_B=n_total_B, n_total_V=n_total_V,
+                                       calibrated=True, 
+                                       mags_B=calibrated_mags_B_dered, 
+                                       mags_V=calibrated_mags_V_dered,
+                                       colors=calibrated_colors_dered,
+                                       save=save_cmd_path,
+                                       isochrone_params=isochrone_params,
+                                       outlier_sigma=args.outlier_sigma)
+                else:
+                    print("Kalibrierung fehlgeschlagen. Zeige instrumentale Magnituden.")
+                    plot_color_magnitude(matched, tabB, tabV, selected, 
+                                       n_total_B=n_total_B, n_total_V=n_total_V, 
+                                       save=save_cmd_path,
+                                       outlier_sigma=args.outlier_sigma)
+            else:
+                print("Keine Kalibrierung durchgeführt. Zeige instrumentale Magnituden.")
+                plot_color_magnitude(matched, tabB, tabV, selected, 
+                                   n_total_B=n_total_B, n_total_V=n_total_V, 
+                                   save=save_cmd_path,
+                                   outlier_sigma=args.outlier_sigma)
+        else:
+            # Keine Kalibrierung - zeige instrumentale Magnituden
+            plot_color_magnitude(matched, tabB, tabV, selected, 
+                               n_total_B=n_total_B, n_total_V=n_total_V, 
+                               save=save_cmd_path,
+                               outlier_sigma=args.outlier_sigma)
+    else:
+        print("Keine übereinstimmenden Quellen gefunden für das Color-Magnitude-Diagramm.")
+    
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
