@@ -23,8 +23,19 @@ Optionen:
     --save-stellar-profiles FILE  Speicherpfad für den Profil/PSF-Plot (relativ zum FITS-Ordner oder absolut)
   --compare-cmd-methods  Vergleicht CMDs aus aperture- und psf-Auswertung in einem gemeinsamen Plot
   --save-cmd-compare FILE  Speicherpfad für den CMD-Methodenvergleich (relativ zum FITS-Ordner oder absolut)
+  --compare-extraction-methods  Statistischer Vergleich der Helligkeitsextraktion (Apertur vs PSF) im
+                          V-Bild; Sterne werden im Bild nummeriert markiert (Nummer 1 = größte Abweichung)
+  --save-extraction-compare FILE  Speicherpfad für den Extraktionsmethoden-Vergleichsplot (relativ zum
+                          FITS-Ordner oder absolut)
+  --compare-aperture-radii R1 [R2 ...]  Extrahiere Helligkeiten mit beliebig vielen Apertur-Radien und
+                          vergleiche die Abweichung zur PSF-Helligkeit je Radius (Boxplot). Erfordert
+                          --compare-extraction-methods.
+  --save-aperture-radii-compare FILE  Speicherpfad für den Apertur-Radius-Vergleich (relativ zum
+                          FITS-Ordner oder absolut)
   --cluster-radius FLOAT  Radius in Pixel um das Zentrum für Sternhaufen-Filterung (Standard: 40% der Bildhöhe, 0 = deaktiviert)
   --cluster-center X Y    Zentrum (x, y) in Pixel für Sternhaufen-Filterung (Standard: Bildmitte)
+  --annulus X Y R_IN BREITE  Nur Sterne in einem Annulus um (x, y) berücksichtigen.
+                          R_IN und BREITE sind Innenradius und Breite in Pixeln.
   --annulus-radii R_INNER R_OUTER  Nur Sterne in einem Ring (Annulus) zwischen innerem (R_INNER) und
                           äußerem (R_OUTER) Radius in Pixel um das Zentrum berücksichtigen.
                           Überschreibt --cluster-radius wenn angegeben.
@@ -287,7 +298,7 @@ def plot_images(images: List[Tuple[Optional[np.ndarray], Optional[dict]]], paths
                 for (x_pos, y_pos), r in zip(positions, radii_to_show):
                     c = Circle((x_pos, y_pos), float(r), fill=False, edgecolor='red', linewidth=1.0, alpha=0.7)
                     ax.add_patch(c)
-            elif aperture_radius:
+            elif aperture_radius and positions:
                 apertures = CircularAperture(positions, r=aperture_radius)
                 apertures.plot(color='red', lw=1.0, alpha=0.7, ax=ax)
         
@@ -596,6 +607,103 @@ def _fit_gaussian_psf_to_profile(r: np.ndarray, profile: np.ndarray,
     model_full = best_amp * np.exp(-(r ** 2) / (2.0 * best_sigma ** 2))
     fwhm_fit = 2.354820045 * best_sigma
     return best_amp, fwhm_fit, model_full
+
+
+def estimate_image_fwhm(data: np.ndarray, fwhm_hint: float = 3.0, max_stars: int = 100,
+                        min_stars: int = 8) -> Optional[Tuple[float, int, float]]:
+    """Schaetze die Stern-FWHM eines Bildes aus hellen, isolierten, nicht gesaettigten Sternen.
+
+    Fuer jeden ausgewaehlten Stern wird ein Gauss an das radiale Profil gefittet; das Ergebnis
+    ist der Median der Einzel-FWHM-Werte.
+
+    Returns:
+        (fwhm, n_sterne, streuung) oder None, wenn zu wenige geeignete Sterne gefunden wurden.
+    """
+    _, median, std = sigma_clipped_stats(data, sigma=3.0)
+    finder_fwhm = max(1.2, 0.85 * float(fwhm_hint))
+
+    sources = None
+    for n_sigma in (20.0, 10.0, 5.0):
+        found = DAOStarFinder(fwhm=finder_fwhm, threshold=median + n_sigma * std)(data - median)
+        if found is not None and len(found) > 0:
+            sources = found
+            if len(found) >= 3 * min_stars:
+                break
+    if sources is None or len(sources) < min_stars:
+        return None
+
+    xy = np.column_stack((np.asarray(sources['x_centroid'], dtype=float),
+                          np.asarray(sources['y_centroid'], dtype=float)))
+    order = np.argsort(np.asarray(sources['peak'], dtype=float))[::-1]
+    # Die hellsten 5 % ueberspringen: gesaettigte Sterne haben flache Kerne und verfaelschen die FWHM
+    order = order[int(0.05 * len(order)):]
+
+    ny, nx = data.shape
+    margin = max(15.0, 5.0 * fwhm_hint)
+    isolation = max(10.0, 4.0 * fwhm_hint)
+    max_radius = max(10.0, 4.0 * fwhm_hint)
+
+    fwhms = []
+    for idx in order[:max(400, 4 * max_stars)]:
+        x, y = xy[idx]
+        if x < margin or y < margin or x > nx - 1 - margin or y > ny - 1 - margin:
+            continue
+        dist = np.hypot(xy[:, 0] - x, xy[:, 1] - y)
+        dist[idx] = np.inf
+        if dist.min() < isolation:
+            continue
+        profile = _radial_profile_from_star(data, float(x), float(y), max_radius)
+        if profile is None:
+            continue
+        fit = _fit_gaussian_psf_to_profile(profile[0], profile[1], float(fwhm_hint))
+        if fit is None:
+            continue
+        fwhms.append(fit[1])
+        if len(fwhms) >= max_stars:
+            break
+
+    if len(fwhms) < min_stars:
+        return None
+    fwhms = np.asarray(fwhms, dtype=float)
+    scatter = 1.4826 * float(np.median(np.abs(fwhms - np.median(fwhms))))
+    return float(np.median(fwhms)), len(fwhms), scatter
+
+
+def _mutual_nearest_pairs(xy_query: np.ndarray, xy_ref: np.ndarray, max_sep: float) -> List[Tuple[int, int]]:
+    """Gegenseitig naechste Nachbarn innerhalb von max_sep (Pixel).
+
+    Ein Paar (i, j) wird nur akzeptiert, wenn j der naechste Referenzstern zu i ist UND
+    i der naechste Query-Stern zu j. Das verhindert, dass zwei Sterne denselben Partner
+    bekommen oder ein weiter entfernter Stern durch die Reihenfolge bevorzugt wird.
+    """
+    xy_query = np.asarray(xy_query, dtype=float).reshape(-1, 2)
+    xy_ref = np.asarray(xy_ref, dtype=float).reshape(-1, 2)
+    n_query, n_ref = len(xy_query), len(xy_ref)
+    if n_query == 0 or n_ref == 0:
+        return []
+
+    nearest_ref = np.empty(n_query, dtype=int)
+    nearest_dist = np.empty(n_query, dtype=float)
+    nearest_query_of_ref = np.zeros(n_ref, dtype=int)
+    best_dist_of_ref = np.full(n_ref, np.inf)
+    ref_idx = np.arange(n_ref)
+
+    chunk = 256
+    for start in range(0, n_query, chunk):
+        stop = min(start + chunk, n_query)
+        diff = xy_query[start:stop, None, :] - xy_ref[None, :, :]
+        dist = np.hypot(diff[..., 0], diff[..., 1])
+        j = dist.argmin(axis=1)
+        nearest_ref[start:stop] = j
+        nearest_dist[start:stop] = dist[np.arange(stop - start), j]
+        i_local = dist.argmin(axis=0)
+        d_min = dist[i_local, ref_idx]
+        better = d_min < best_dist_of_ref
+        nearest_query_of_ref[better] = i_local[better] + start
+        best_dist_of_ref[better] = d_min[better]
+
+    return [(i, int(nearest_ref[i])) for i in range(n_query)
+            if nearest_dist[i] <= max_sep and nearest_query_of_ref[nearest_ref[i]] == i]
 
 
 def plot_star_profile_psf_samples(data: np.ndarray, phot_table, fwhm: float,
@@ -951,7 +1059,8 @@ def detect_and_photometry(data: np.ndarray, fwhm: float = 3.0, threshold_sigma: 
 
 
 def detect_and_psf_photometry(data: np.ndarray, fwhm: float = 3.0, threshold_sigma: float = 5.0,
-                              aperture_radius: float = None, detect_fwhm_scale: float = 0.85):
+                              aperture_radius: float = None, detect_fwhm_scale: float = 0.85,
+                              psf_fwhm: Optional[float] = None):
     """Erkenne Quellen mit DAOStarFinder und führe PSF-Photometrie durch.
     
     PSF-Photometrie ist besser geeignet für dichte Sternfelder, da sie einzelne Sterne
@@ -962,7 +1071,13 @@ def detect_and_psf_photometry(data: np.ndarray, fwhm: float = 3.0, threshold_sig
     - aperture_radius: Der verwendete Aperturradius (für Kompatibilität mit Aperturphotometrie)
     
     Parameters:
-        aperture_radius: Wenn None, wird automatisch 3.0×FWHM verwendet.
+        aperture_radius: Wenn None, wird automatisch 3.0×PSF-FWHM verwendet.
+        psf_fwhm: FWHM des PSF-Modells in Pixel. Wenn None, wird sie pro Bild aus hellen,
+            isolierten Sternen geschätzt (Fallback: fwhm).
+
+    Fits mit Problem-Flags (ausserhalb des Bildes, Fluss <= 0, moegliche Nicht-Konvergenz)
+    sowie Fits, die weiter als eine FWHM von der Startposition weggewandert sind
+    (Verwechslung mit einem Nachbarstern), werden aus der Tabelle entfernt.
     
     Returns:
         (phot_table, aperture_radius): Tuple aus Photometrie-Tabelle und verwendetem Aperturradius
@@ -980,10 +1095,24 @@ def detect_and_psf_photometry(data: np.ndarray, fwhm: float = 3.0, threshold_sig
         return detect_and_photometry(data, fwhm=fwhm, threshold_sigma=threshold_sigma, 
                                     aperture_radius=aperture_radius)
     
+    # FWHM des PSF-Modells: manuell oder pro Bild aus hellen Sternen geschätzt
+    if psf_fwhm is not None:
+        psf_fwhm_used = float(psf_fwhm)
+        print(f"  PSF-FWHM (manuell): {psf_fwhm_used:.2f} Pixel")
+    else:
+        fwhm_estimate = estimate_image_fwhm(data, fwhm_hint=fwhm)
+        if fwhm_estimate is None:
+            psf_fwhm_used = float(fwhm)
+            print(f"  Warnung: PSF-FWHM konnte nicht aus Sternen geschätzt werden. Verwende --fwhm = {psf_fwhm_used:.2f} Pixel")
+        else:
+            psf_fwhm_used, n_fwhm_stars, fwhm_scatter = fwhm_estimate
+            print(f"  PSF-FWHM aus {n_fwhm_stars} hellen, isolierten Sternen geschätzt: "
+                  f"{psf_fwhm_used:.2f} ± {fwhm_scatter:.2f} Pixel (--fwhm = {fwhm:.2f})")
+
     # Automatische Apertur-Berechnung basierend auf FWHM
     if aperture_radius is None:
-        aperture_radius = 3.0 * fwhm
-        print(f"  Automatische Apertur: radius = 3.0 × FWHM = 3.0 × {fwhm:.1f} = {aperture_radius:.1f} Pixel")
+        aperture_radius = 3.0 * psf_fwhm_used
+        print(f"  Automatische Apertur: radius = 3.0 × FWHM = 3.0 × {psf_fwhm_used:.1f} = {aperture_radius:.1f} Pixel")
     else:
         print(f"  Manuelle Apertur: radius = {aperture_radius:.1f} Pixel")
     
@@ -1003,10 +1132,13 @@ def detect_and_psf_photometry(data: np.ndarray, fwhm: float = 3.0, threshold_sig
         from photutils.psf import IterativePSFPhotometry, GaussianPSF
         
         # Erstelle ein einfaches Gauss-PSF-Modell mit bekanntem FWHM
-        psf_model = GaussianPSF(x_fwhm=fwhm, y_fwhm=fwhm)
+        psf_model = GaussianPSF(x_fwhm=psf_fwhm_used, y_fwhm=psf_fwhm_used)
         
-        # Definiere die Größe der Anpassungsregion um jeden Stern
-        fit_shape = (int(2*aperture_radius+1), int(2*aperture_radius+1))
+        # Definiere die Größe der Anpassungsregion um jeden Stern (ungerade Kantenlaenge)
+        fit_size = int(2*aperture_radius+1)
+        if fit_size % 2 == 0:
+            fit_size += 1
+        fit_shape = (fit_size, fit_size)
         
         # Erstelle das PSF-Photometrie-Objekt
         photometry = IterativePSFPhotometry(
@@ -1025,6 +1157,33 @@ def detect_and_psf_photometry(data: np.ndarray, fwhm: float = 3.0, threshold_sig
             return detect_and_photometry(data, fwhm=fwhm, threshold_sigma=threshold_sigma, 
                                         aperture_radius=aperture_radius)
         
+        # Entferne unzuverlaessige Fits (Nicht-Konvergenz, Fluss <= 0, ausserhalb des Bildes)
+        # und Fits, die zu einem Nachbarstern gewandert sind.
+        required_cols = {'x_fit', 'y_fit', 'x_init', 'y_init', 'flux_fit'}
+        if required_cols.issubset(phot_table.colnames):
+            n_before = len(phot_table)
+            x_fit = np.asarray(phot_table['x_fit'], dtype=float)
+            y_fit = np.asarray(phot_table['y_fit'], dtype=float)
+            flux_fit = np.asarray(phot_table['flux_fit'], dtype=float)
+            drift = np.hypot(x_fit - np.asarray(phot_table['x_init'], dtype=float),
+                             y_fit - np.asarray(phot_table['y_init'], dtype=float))
+            invalid = ~(np.isfinite(x_fit) & np.isfinite(y_fit) & np.isfinite(flux_fit) & (flux_fit > 0))
+            if 'flags' in phot_table.colnames:
+                # 2 = ausserhalb des Bildes, 4 = Fluss <= 0, 8 = moegliche Nicht-Konvergenz
+                bad_flags = (np.asarray(phot_table['flags']).astype(int) & (2 | 4 | 8)) != 0
+            else:
+                bad_flags = np.zeros(n_before, dtype=bool)
+            drifted = np.isfinite(drift) & (drift > psf_fwhm_used)
+            keep = ~(invalid | bad_flags | drifted)
+            print(f"  PSF-Fits entfernt: {int(np.sum(~keep))}/{n_before} "
+                  f"(Nicht-Konvergenz/Flag: {int(np.sum(bad_flags))}, ungueltiger Fluss/Position: {int(np.sum(invalid))}, "
+                  f"Position > {psf_fwhm_used:.1f} px verrutscht: {int(np.sum(drifted))}; Mehrfachnennung moeglich)")
+            phot_table = phot_table[keep]
+            if len(phot_table) == 0:
+                print("  Warnung: Alle PSF-Fits verworfen. Fallback auf Aperturphotometrie...")
+                return detect_and_photometry(data, fwhm=fwhm, threshold_sigma=threshold_sigma,
+                                            aperture_radius=aperture_radius)
+
         # Stelle sicher, dass alle notwendigen Spalten existieren
         if 'x_fit' in phot_table.colnames:
             phot_table['x'] = phot_table['x_fit']
@@ -1097,7 +1256,8 @@ def detect_and_photometry_wrapper(data: np.ndarray, method: str = 'aperture', fw
                                    cluster_center: Optional[Tuple[float, float]] = None,
                                    cluster_radius: Optional[float] = None,
                                    aperture_per_star: bool = False,
-                                   detect_fwhm_scale: float = 0.85):
+                                   detect_fwhm_scale: float = 0.85,
+                                   psf_fwhm: Optional[float] = None):
     """Wrapper-Funktion, die zwischen Apertur- und PSF-Photometrie wählt.
     
     Parameters:
@@ -1109,6 +1269,7 @@ def detect_and_photometry_wrapper(data: np.ndarray, method: str = 'aperture', fw
         cluster_center: Zentrum fuer Cluster-Selektion fuer Auto-Apertur
         cluster_radius: Radius fuer Cluster-Selektion fuer Auto-Apertur
         aperture_per_star: Falls True, pro Stern individuelle Apertur/Annulus-Radien
+        psf_fwhm: FWHM des PSF-Modells (nur method='psf'); None = pro Bild aus Sternen schätzen
     
     Returns:
         (phot_table, aperture_radius): Photometrie-Ergebnisse
@@ -1116,7 +1277,8 @@ def detect_and_photometry_wrapper(data: np.ndarray, method: str = 'aperture', fw
     if method == 'psf':
         return detect_and_psf_photometry(data, fwhm=fwhm, threshold_sigma=threshold_sigma, 
                                          aperture_radius=aperture_radius,
-                                         detect_fwhm_scale=detect_fwhm_scale)
+                                         detect_fwhm_scale=detect_fwhm_scale,
+                                         psf_fwhm=psf_fwhm)
     else:  # default: 'aperture'
         return detect_and_photometry(data, fwhm=fwhm, threshold_sigma=threshold_sigma, 
                                      aperture_radius=aperture_radius,
@@ -1275,15 +1437,7 @@ def match_sources(tab1, tab2, max_sep: float = 5.0, search_radius: float = 100.0
         coords1_transformed = coords1 + best_offset
         
         # Finde alle Matches
-        all_matches = []
-        used2 = set()
-        for i1 in range(len(coords1)):
-            dists = np.linalg.norm(coords2 - coords1_transformed[i1], axis=1)
-            i2 = int(np.argmin(dists))
-            
-            if dists[i2] <= max_sep and i2 not in used2:
-                all_matches.append((i1, i2))
-                used2.add(i2)
+        all_matches = _mutual_nearest_pairs(coords1_transformed, coords2, max_sep)
         
         # Filtere Matches: NUR Sterne die im B-Filter (tab1) innerhalb des Radius liegen
         if indices1_in_radius is not None:
@@ -2779,18 +2933,13 @@ def plot_cmd_method_comparison(aperture_points, psf_points, paths, save: Optiona
     if aperture_points is not None and psf_points is not None:
         ap_xy = np.column_stack((aperture_points['x'], aperture_points['y']))
         psf_xy = np.column_stack((psf_points['x'], psf_points['y']))
-        used_psf = set()
-        max_position_delta = 2.0
+        pair_lookup = dict(_mutual_nearest_pairs(ap_xy, psf_xy, 2.0)) if len(psf_xy) else {}
 
         for i_ap, xy_ap in enumerate(ap_xy):
-            if len(psf_xy) == 0:
-                break
-            dists = np.linalg.norm(psf_xy - xy_ap, axis=1)
-            i_psf = int(np.argmin(dists))
-            if dists[i_psf] > max_position_delta or i_psf in used_psf:
+            i_psf = pair_lookup.get(i_ap)
+            if i_psf is None:
                 continue
 
-            used_psf.add(i_psf)
             delta_color_values.append(psf_points['color'][i_psf] - aperture_points['color'][i_ap])
             delta_mag_values.append(psf_points['mag_v'][i_psf] - aperture_points['mag_v'][i_ap])
             ax.plot(
@@ -2879,6 +3028,357 @@ def plot_cmd_method_comparison(aperture_points, psf_points, paths, save: Optiona
     plt.show()
 
 
+def _match_aperture_psf_entries(tab_aperture, tab_psf, max_sep: float = 3.0,
+                                cluster_center: Optional[Tuple[float, float]] = None,
+                                cluster_radius: Optional[float] = None,
+                                annulus_inner: Optional[float] = None,
+                                zero_point: float = 25.0) -> list:
+    """Matcht Apertur- und PSF-Quellen im selben Bild und liefert Delta(mag) je Stern.
+
+    Liefert eine (nach |Delta| absteigend sortierte) Liste von Tupeln
+    (x, y, mag_ap, mag_psf, delta, x_ap, y_ap, x_psf, y_psf), wobei x/y der
+    Mittelwert der Apertur- und PSF-Position ist.
+    """
+    if tab_aperture is None or tab_psf is None or len(tab_aperture) == 0 or len(tab_psf) == 0:
+        return []
+
+    xy_ap_all = np.column_stack((np.asarray(tab_aperture['x'], dtype=float), np.asarray(tab_aperture['y'], dtype=float)))
+    xy_psf = np.column_stack((np.asarray(tab_psf['x'], dtype=float), np.asarray(tab_psf['y'], dtype=float)))
+
+    # Optional auf Cluster-Radius/Annulus einschraenken
+    candidate_idx = np.arange(len(xy_ap_all))
+    if cluster_radius is not None and cluster_center is not None:
+        dist = np.linalg.norm(xy_ap_all - np.array(cluster_center), axis=1)
+        if annulus_inner is not None:
+            mask = (dist >= annulus_inner) & (dist <= cluster_radius)
+        else:
+            mask = dist <= cluster_radius
+        candidate_idx = np.where(mask)[0]
+
+    pair_lookup = dict(_mutual_nearest_pairs(xy_ap_all, xy_psf, max_sep)) if len(xy_psf) else {}
+    entries = []  # (x, y, mag_ap, mag_psf, delta, x_ap, y_ap, x_psf, y_psf)
+    for i_ap in candidate_idx:
+        i_psf = pair_lookup.get(int(i_ap))
+        if i_psf is None:
+            continue
+
+        flux_ap = float(tab_aperture['aperture_sum_bkgsub'][i_ap])
+        flux_psf = float(tab_psf['aperture_sum_bkgsub'][i_psf])
+        mag_ap = instrumental_magnitude(flux_ap, zero_point=zero_point)
+        mag_psf = instrumental_magnitude(flux_psf, zero_point=zero_point)
+        if mag_ap is None or mag_psf is None:
+            continue
+
+        x_ap, y_ap = float(xy_ap_all[i_ap][0]), float(xy_ap_all[i_ap][1])
+        x_psf, y_psf = float(xy_psf[i_psf][0]), float(xy_psf[i_psf][1])
+        x_avg = 0.5 * (x_ap + x_psf)
+        y_avg = 0.5 * (y_ap + y_psf)
+        entries.append((x_avg, y_avg, mag_ap, mag_psf, mag_psf - mag_ap, x_ap, y_ap, x_psf, y_psf))
+
+    entries.sort(key=lambda e: abs(e[4]), reverse=True)
+    return entries
+
+
+def plot_extraction_method_comparison_combined(data: np.ndarray, path: str, tab_aperture, tab_psf,
+                                               max_sep: float = 3.0,
+                                               cluster_center: Optional[Tuple[float, float]] = None,
+                                               cluster_radius: Optional[float] = None,
+                                               annulus_inner: Optional[float] = None,
+                                               aperture_radius: float = 9.0,
+                                               fwhm: float = 3.0,
+                                               zero_point: float = 25.0,
+                                               save: Optional[str] = None) -> None:
+    """Vergleiche Apertur- und PSF-Helligkeiten Stern fuer Stern im selben (V-)Bild.
+
+    Fasst drei Ansichten in einer Abbildung zusammen:
+    1. Das V-Bild mit nummerierten Sternen (Nummer 1 = groesste Abweichung).
+    2. Ein Saeulendiagramm Sternnummer gegen Delta(mag) = psf - aperture.
+    3. Ein 3D-Helligkeitsplot des Sterns mit der groessten Abweichung, ueberlagert mit
+       PSF-Gauss-Fit und Apertur-Radius.
+    """
+    entries = _match_aperture_psf_entries(
+        tab_aperture, tab_psf, max_sep=max_sep,
+        cluster_center=cluster_center, cluster_radius=cluster_radius,
+        annulus_inner=annulus_inner, zero_point=zero_point
+    )
+
+    if not entries:
+        print("Keine gemeinsamen Sterne fuer den Extraktionsmethoden-Vergleich gefunden.")
+        return
+
+    deltas = np.array([e[4] for e in entries])
+    rms = float(np.sqrt(np.mean(deltas**2)))
+    mean_delta = float(np.mean(deltas))
+    std_delta = float(np.std(deltas))
+    max_entry = entries[0]
+
+    print("\n=== Extraktionsmethoden-Vergleich (Apertur vs PSF) im V-Bild ===")
+    print(f"  Gemeinsame Sterne: {len(entries)}")
+    print(f"  RMS Delta(mag) [psf-aperture] = {rms:.4f} mag")
+    print(f"  Mittel Delta(mag) = {mean_delta:+.4f} mag, Std = {std_delta:.4f} mag")
+    print(f"  Groesste Abweichung: Stern #1 bei (x={max_entry[0]:.1f}, y={max_entry[1]:.1f}), "
+          f"Delta = {max_entry[4]:+.4f} mag (aperture={max_entry[2]:.3f}, psf={max_entry[3]:.3f})")
+
+    max_abs_delta = float(np.max(np.abs(deltas)))
+    if max_abs_delta <= 0:
+        max_abs_delta = 1e-6
+    cmap = plt.get_cmap('coolwarm')
+
+    fig = plt.figure(figsize=(14, 12))
+    gs = fig.add_gridspec(2, 2, height_ratios=[1.3, 1.0])
+    ax_img = fig.add_subplot(gs[0, 0])
+    ax_3d = fig.add_subplot(gs[0, 1], projection='3d')
+    # Deaktiviert Matplotlibs automatische Tiefensortierung, die Overlays (PSF-Fit,
+    # Zentren-Marker) sonst faelschlich hinter der Oberflaeche verschwinden laesst.
+    ax_3d.computed_zorder = False
+    # Feste, separate Colorbar-Achse neben ax_3d: fig.colorbar(ax=ax_3d) wuerde bei
+    # jeder Neuzeichnung (Klick) ax_3d ueber die Gridspec-Zuordnung erneut verkleinern.
+    ax_3d_pos = ax_3d.get_position()
+    cax_3d = fig.add_axes([ax_3d_pos.x1 + 0.015, ax_3d_pos.y0, 0.015, ax_3d_pos.height])
+    ax_bar = fig.add_subplot(gs[1, :])
+
+    # --- Panel 1: V-Bild mit nummerierten Sternen ---
+    try:
+        norm_img = ImageNormalize(data, interval=ZScaleInterval())
+    except Exception:
+        norm_img = None
+    ax_img.imshow(data, cmap='gray', origin='lower', norm=norm_img)
+    ax_img.set_title(f'V-Bild: nummerierte Sterne\n{os.path.basename(path)}')
+
+    for i, entry in enumerate(entries, start=1):
+        x, y, mag_ap, mag_psf, delta = entry[:5]
+        color = cmap(0.5 + 0.5 * (delta / max_abs_delta))
+        is_max = (i == 1)
+        ax_img.plot(x, y, 'o', markersize=10 if is_max else 7,
+                    markerfacecolor=color, markeredgecolor='yellow' if is_max else 'black',
+                    markeredgewidth=1.8 if is_max else 0.7, alpha=0.9)
+        ax_img.annotate(str(i), (x, y), textcoords="offset points", xytext=(6, 6),
+                        fontsize=9 if is_max else 7, color='yellow' if is_max else 'white',
+                        fontweight='bold' if is_max else 'normal')
+
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(vmin=-max_abs_delta, vmax=max_abs_delta))
+    sm.set_array([])
+    cbar = fig.colorbar(sm, ax=ax_img, fraction=0.046, pad=0.04)
+    cbar.set_label('\u0394mag (psf - aperture)')
+
+    stats_text = (
+        f'Gemeinsame Sterne: {len(entries)}\n'
+        f'RMS \u0394mag: {rms:.4f} mag\n'
+        f'Mittel \u0394mag: {mean_delta:+.4f} mag\n'
+        f'Std \u0394mag: {std_delta:.4f} mag\n'
+        f'Groesste Abw.: Stern #1 ({max_entry[4]:+.4f} mag)'
+    )
+    ax_img.text(0.02, 0.98, stats_text, transform=ax_img.transAxes, va='top', ha='left', fontsize=8,
+                bbox=dict(boxstyle='round', facecolor='white', alpha=0.85, edgecolor='0.7'))
+
+    # --- Panel 2: Saeulendiagramm Sternnummer vs Delta(mag) ---
+    numbers = np.arange(1, len(entries) + 1)
+    colors = [cmap(0.5 + 0.5 * (d / max_abs_delta)) for d in deltas]
+    bars = ax_bar.bar(numbers, deltas, color=colors, edgecolor='black', linewidth=0.4)
+    bars[0].set_edgecolor('yellow')
+    bars[0].set_linewidth(2.0)
+    ax_bar.axhline(0, color='gray', linewidth=1.0)
+    ax_bar.set_xlabel('Sternnummer (1 = gr\u00f6\u00dfte Abweichung)')
+    ax_bar.set_ylabel('\u0394mag (psf - aperture)')
+    ax_bar.set_title('Helligkeitsdifferenz pro Stern')
+    ax_bar.grid(alpha=0.3, axis='y')
+
+    # --- Panel 3: 3D-Helligkeitsplot eines Sterns (per Klick im linken Bild waehlbar) ---
+    from matplotlib.lines import Line2D
+
+    def _draw_star_3d_panel(entry, star_number):
+        ax_3d.clear()
+        ax_3d.computed_zorder = False
+        cax_3d.clear()
+        cax_3d.set_visible(True)
+
+        x, y, mag_ap, mag_psf, delta, x_ap, y_ap, x_psf, y_psf = entry
+        # Abstand der Apertur- und PSF-Zentren: grosser Wert deutet auf einen nahen
+        # Nachbarstern hin (Verwechslungsgefahr beim Matching). Der Ausschnitt wird
+        # entsprechend vergroessert, damit ein solcher Nachbar sichtbar bleibt.
+        center_sep = float(np.hypot(x_ap - x_psf, y_ap - y_psf))
+        half = int(np.ceil(max(12.0, 3.0 * aperture_radius, 6.0 * fwhm, 2.2 * center_sep + 10.0)))
+        ny, nx = data.shape
+        x0, y0 = int(round(x)), int(round(y))
+        xmin = max(0, x0 - half)
+        xmax = min(nx, x0 + half + 1)
+        ymin = max(0, y0 - half)
+        ymax = min(ny, y0 + half + 1)
+        cut = np.asarray(data[ymin:ymax, xmin:xmax], dtype=float)
+
+        if cut.size == 0:
+            ax_3d.set_title("Kein Bildausschnitt fuer den 3D-Sternplot verfuegbar.")
+            cax_3d.set_visible(False)
+            return
+
+        yy, xx = np.indices(cut.shape)
+        xx = xx + xmin
+        yy = yy + ymin
+
+        prof = _radial_profile_from_star(data, x_psf, y_psf, max_radius=half)
+        fit = None
+        bkg = float(np.median(cut))
+        if prof is not None:
+            r, y_prof, bkg = prof
+            fit = _fit_gaussian_psf_to_profile(r, y_prof, fwhm_hint=fwhm)
+
+        z_data = cut - bkg
+        surf = ax_3d.plot_surface(xx, yy, z_data, cmap='viridis', alpha=0.8, linewidth=0,
+                                  antialiased=True, rstride=1, cstride=1, zorder=1)
+        fig.colorbar(surf, cax=cax_3d, label='Signal \u00fcber Hintergrund [ADU]')
+
+        # Gleiche x/y-Skalierung erzwingen, sonst verzerrt matplotlib die Achsen
+        # unabhaengig voneinander und der Apertur-Kreis wirkt faelschlich oval/versetzt.
+        # Die z-Achse bekommt eine feste, rein optische Boxhoehe (keine ADU-Werte!),
+        # da set_box_aspect nur die Seitenverhaeltnisse der Box vorgibt.
+        dx = float(xx.max() - xx.min())
+        dy = float(yy.max() - yy.min())
+        ax_3d.set_box_aspect((dx, dy, 0.6 * max(dx, dy)))
+
+        def _surface_z_at(px, py):
+            ix = int(np.clip(round(px) - xmin, 0, z_data.shape[1] - 1))
+            iy = int(np.clip(round(py) - ymin, 0, z_data.shape[0] - 1))
+            return float(z_data[iy, ix])
+
+        fwhm_fit = None
+        if fit is not None:
+            amp, fwhm_fit, _ = fit
+            sigma = fwhm_fit / 2.354820045
+            # Die azimutal gemittelte Profil-Amplitude unterschaetzt oft den tatsaechlichen
+            # (scharfen) Peak. Fuer eine sichtbare Ueberlagerung wird die Modellhoehe auf den
+            # real beobachteten Peak skaliert; Breite/Form (Sigma) kommt weiterhin aus dem Fit.
+            amp_display = max(amp, _surface_z_at(x_psf, y_psf))
+            z_model = amp_display * np.exp(-(((xx - x_psf) ** 2 + (yy - y_psf) ** 2) / (2.0 * sigma ** 2)))
+            # Grober Gitterabstand, damit das Drahtgitter die darunterliegende
+            # Datenoberflaeche nicht vollstaendig verdeckt (nur Kontur, kein Vollflaechen-Netz).
+            model_stride = max(2, cut.shape[0] // 14)
+            ax_3d.plot_wireframe(xx, yy, z_model, color='red', linewidth=1.1, alpha=0.85,
+                                rstride=model_stride, cstride=model_stride, zorder=5)
+        else:
+            ax_3d.text2D(0.02, 0.90, 'Kein stabiler PSF-Fit\n(vermutlich durch Sternhaeufung gestoert)',
+                        transform=ax_3d.transAxes, fontsize=8, color='red',
+                        bbox=dict(boxstyle='round', facecolor='white', alpha=0.85, edgecolor='red'))
+
+        # Apertur-Radius um das tatsaechliche Apertur-Zentrum (nicht den Mittelwert)
+        theta = np.linspace(0, 2 * np.pi, 100)
+        xc = x_ap + aperture_radius * np.cos(theta)
+        yc = y_ap + aperture_radius * np.sin(theta)
+        floor_z = float(np.nanmin(z_data))
+        zc = np.full_like(xc, floor_z)
+        ax_3d.plot(xc, yc, zc, color='orange', linewidth=2.5, zorder=6)
+
+        # Zentren beider Methoden markieren, inkl. Lotlinie zur Oberflaeche,
+        # damit eine Positionsabweichung (z.B. durch einen Nachbarstern) sichtbar wird
+        z_ap_top = _surface_z_at(x_ap, y_ap)
+        z_psf_top = _surface_z_at(x_psf, y_psf)
+        ax_3d.plot([x_ap, x_ap], [y_ap, y_ap], [floor_z, z_ap_top], color='orange', linestyle='--', linewidth=1.5, zorder=6)
+        ax_3d.scatter([x_ap], [y_ap], [z_ap_top], color='orange', s=90, marker='o',
+                     edgecolor='black', linewidth=1.2, depthshade=False, zorder=10)
+        ax_3d.plot([x_psf, x_psf], [y_psf, y_psf], [floor_z, z_psf_top], color='red', linestyle='--', linewidth=1.5, zorder=6)
+        ax_3d.scatter([x_psf], [y_psf], [z_psf_top], color='red', s=90, marker='^',
+                     edgecolor='black', linewidth=1.2, depthshade=False, zorder=11)
+
+        psf_label = 'PSF-Gau\u00df-Fit' + (f' (FWHM={fwhm_fit:.2f}px)' if fwhm_fit is not None else ' (kein stabiler Fit)')
+        legend_elements = [
+            Line2D([0], [0], color='red', lw=2, label=psf_label),
+            Line2D([0], [0], color='orange', lw=2, label=f'Apertur-Radius ({aperture_radius:.1f}px)'),
+            Line2D([0], [0], marker='o', color='orange', linestyle='None', markeredgecolor='black', label='Apertur-Zentrum'),
+            Line2D([0], [0], marker='^', color='red', linestyle='None', markeredgecolor='black', label='PSF-Zentrum'),
+        ]
+        ax_3d.legend(handles=legend_elements, loc='upper left', fontsize=7)
+
+        ax_3d.set_xlabel('x [Pixel]')
+        ax_3d.set_ylabel('y [Pixel]')
+        ax_3d.set_zlabel('Signal \u00fcber Hintergrund [ADU]')
+        ax_3d.set_title(
+            f'Stern #{star_number}\n'
+            f'\u0394mag={delta:+.3f} (aperture={mag_ap:.3f}, psf={mag_psf:.3f}), '
+            f'Zentren-Abstand={center_sep:.1f}px',
+            fontsize=9
+        )
+
+    _draw_star_3d_panel(max_entry, 1)
+
+    def _on_star_click(event):
+        # Klick auf einen nummerierten Stern im linken Bild aktualisiert den 3D-Plot
+        # (funktioniert nur mit interaktivem matplotlib-Backend, z.B. beim direkten Anzeigen).
+        if event.inaxes is not ax_img or event.xdata is None or event.ydata is None:
+            return
+        click_xy = np.array([event.xdata, event.ydata])
+        positions = np.array([[e[0], e[1]] for e in entries])
+        idx = int(np.argmin(np.linalg.norm(positions - click_xy, axis=1)))
+        print(f"  -> Stern #{idx + 1} angeklickt (x={entries[idx][0]:.1f}, y={entries[idx][1]:.1f}), "
+              f"\u0394mag={entries[idx][4]:+.3f}")
+        _draw_star_3d_panel(entries[idx], idx + 1)
+        fig.canvas.draw_idle()
+
+    fig.canvas.mpl_connect('button_press_event', _on_star_click)
+    print("  Tipp: Bei interaktivem Anzeigefenster kannst du im linken Bild auf einen "
+          "nummerierten Stern klicken, um den 3D-Plot dafuer zu erzeugen.")
+
+    fig.suptitle('Extraktionsmethoden-Vergleich: Apertur vs PSF', fontsize=14)
+    plt.tight_layout()
+    if save:
+        try:
+            fig.savefig(save, dpi=150)
+            print(f"Extraktionsmethoden-Vergleich gespeichert: {save}")
+        except Exception as e:
+            print(f"Fehler beim Speichern des Extraktionsmethoden-Vergleichs: {e}", file=sys.stderr)
+    plt.show()
+
+
+def plot_aperture_radius_comparison(radii, delta_lists, save: Optional[str] = None) -> None:
+    """Vergleiche Delta(mag) = psf - aperture fuer mehrere Apertur-Radien (Boxplot + Streupunkte).
+
+    radii: Liste der verwendeten Apertur-Radien in Pixel.
+    delta_lists: Liste von Listen mit Delta(mag)-Werten, eine Liste je Radius.
+    """
+    valid = [(r, d) for r, d in zip(radii, delta_lists) if d]
+    if not valid:
+        print("Keine Daten fuer den Apertur-Radius-Vergleich verfuegbar.")
+        return
+
+    radii_valid = [r for r, _ in valid]
+    delta_lists_valid = [np.asarray(d, dtype=float) for _, d in valid]
+
+    print("\n=== Apertur-Radius-Vergleich: Abweichung zur PSF-Helligkeit ===")
+    for r, deltas in zip(radii_valid, delta_lists_valid):
+        rms = float(np.sqrt(np.mean(deltas**2)))
+        mean_delta = float(np.mean(deltas))
+        std_delta = float(np.std(deltas))
+        print(f"  Radius={r:.1f}px: n={len(deltas)}, RMS={rms:.4f} mag, "
+              f"Mittel={mean_delta:+.4f} mag, Std={std_delta:.4f} mag")
+
+    fig, ax = plt.subplots(figsize=(max(9.0, 1.4 * len(radii_valid) + 3.0), 6))
+    labels = [f'{r:.1f}px' for r in radii_valid]
+    bp = ax.boxplot(delta_lists_valid, tick_labels=labels, showmeans=True, patch_artist=True)
+
+    colors = plt.get_cmap('viridis')(np.linspace(0.25, 0.8, len(radii_valid)))
+    for patch, color in zip(bp['boxes'], colors):
+        patch.set_facecolor(color)
+        patch.set_alpha(0.6)
+
+    rng = np.random.default_rng(42)
+    for i, deltas in enumerate(delta_lists_valid, start=1):
+        jitter = rng.normal(0, 0.05, size=len(deltas))
+        ax.scatter(np.full(len(deltas), i) + jitter, deltas, s=14, color='black', alpha=0.35, zorder=3)
+
+    ax.axhline(0, color='gray', linewidth=1.0)
+    ax.set_xlabel('Apertur-Radius')
+    ax.set_ylabel('\u0394mag (psf - aperture)')
+    ax.set_title('Einfluss des Apertur-Radius auf die Abweichung zur PSF-Helligkeit')
+    ax.grid(alpha=0.3, axis='y')
+
+    plt.tight_layout()
+    if save:
+        try:
+            fig.savefig(save, dpi=150)
+            print(f"Apertur-Radius-Vergleich gespeichert: {save}")
+        except Exception as e:
+            print(f"Fehler beim Speichern des Apertur-Radius-Vergleichs: {e}", file=sys.stderr)
+    plt.show()
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description='Zeige zwei FITS-Dateien aus einem Ordner an und führe Aperturphotometrie durch')
     parser.add_argument('folder', help='Pfad zum Ordner mit FITS-Dateien')
@@ -2893,12 +3393,25 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help='Vergleiche CMDs von aperture und psf in einem gemeinsamen Plot mit unterschiedlichen Farben.')
     parser.add_argument('--save-cmd-compare', type=str, default=None,
                         help='Optional: Pfad (z.B. cmd_compare.png) zum Speichern des CMD-Methodenvergleichs.')
+    parser.add_argument('--compare-extraction-methods', action='store_true',
+                        help='Statistischer Vergleich der Helligkeitsextraktion (Apertur vs PSF) im V-Bild; '
+                             'Sterne werden im Bild nummeriert markiert (Nummer 1 = groesste Abweichung).')
+    parser.add_argument('--save-extraction-compare', type=str, default=None,
+                        help='Optional: Pfad (z.B. extraction_compare.png) zum Speichern des Extraktionsmethoden-Vergleichs.')
+    parser.add_argument('--compare-aperture-radii', type=float, nargs='+', default=None, metavar='R',
+                        help='Extrahiere Helligkeiten mit beliebig vielen Apertur-Radien (Pixel, mind. 1) und '
+                             'vergleiche die Abweichung zur PSF-Helligkeit je Radius (Boxplot). '
+                             'Erfordert --compare-extraction-methods.')
+    parser.add_argument('--save-aperture-radii-compare', type=str, default=None,
+                        help='Optional: Pfad (z.B. aperture_radii_compare.png) zum Speichern des Apertur-Radius-Vergleichs.')
     parser.add_argument('--verbose', '-v', action='store_true', help='Mehr Ausgaben')
     parser.add_argument('--aperture', type=float, default=None, 
                        help='Aperturradius in Pixel. Wenn nicht angegeben: automatisch aus dem hellsten Stern im Cluster-Radius.')
     parser.add_argument('--aperture-per-star', action='store_true',
                        help='Passe Apertur/Annulus pro Stern individuell aus dem lokalen Sternprofil an (nur aperture-Methode).')
     parser.add_argument('--fwhm', type=float, default=3.0, help='FWHM in Pixel für Quellenfindung (Standard 3.0)')
+    parser.add_argument('--psf-fwhm', type=float, default=None,
+                        help='FWHM des PSF-Modells in Pixel (Standard: pro Bild automatisch aus hellen Sternen)')
     parser.add_argument('--detect-fwhm-scale', type=float, default=0.85,
                         help='Skalierung des FWHM nur für die Peak-Erkennung. Kleiner trennt nahe Sterne besser (Standard 0.85).')
     parser.add_argument('--threshold', type=float, default=5.0, help='Schwelle in sigma für Quellenfindung (Standard 5.0)')
@@ -2916,6 +3429,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help=('Nur Sterne in einem Ring (Annulus) zwischen innerem (R_INNER) und äußerem '
                               '(R_OUTER) Radius in Pixel um das Zentrum berücksichtigen. '
                               'Überschreibt --cluster-radius.'))
+    parser.add_argument('--annulus', type=float, nargs=4, default=None,
+                        metavar=('X', 'Y', 'R_IN', 'BREITE'),
+                        help=('Sternauswahl in einem Annulus um (X, Y). R_IN ist der Innenradius, '
+                              'BREITE die Annulus-Breite in Pixeln. Nicht mit --cluster-radius, '
+                              '--cluster-center oder --annulus-radii kombinierbar.'))
     parser.add_argument('--calibrate', action='store_true',
                         help='Aktiviere interaktive Kalibrierung mit Referenzstern')
     parser.add_argument('--calibrate-file', type=str, default=None,
@@ -2935,6 +3453,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.detect_fwhm_scale <= 0:
         print("--detect-fwhm-scale muss > 0 sein.", file=sys.stderr)
         return 2
+    if args.annulus is not None:
+        if args.cluster_radius is not None or args.cluster_center is not None or args.annulus_radii is not None:
+            print("--annulus kann nicht mit --cluster-radius, --cluster-center oder --annulus-radii kombiniert werden.",
+                  file=sys.stderr)
+            return 2
+        x_center, y_center, r_inner, annulus_width = args.annulus
+        if not np.all(np.isfinite(args.annulus)):
+            print("Die Werte für --annulus müssen endlich sein.", file=sys.stderr)
+            return 2
+        if r_inner < 0 or annulus_width <= 0:
+            print("--annulus benötigt R_IN >= 0 und BREITE > 0.", file=sys.stderr)
+            return 2
 
     folder = args.folder
     if not os.path.isdir(folder):
@@ -2970,6 +3500,20 @@ def main(argv: Optional[List[str]] = None) -> int:
             save_cmd_compare_path = args.save_cmd_compare
         else:
             save_cmd_compare_path = get_output_path(folder, args.save_cmd_compare)
+
+    save_extraction_compare_path = None
+    if args.save_extraction_compare:
+        if os.path.isabs(args.save_extraction_compare):
+            save_extraction_compare_path = args.save_extraction_compare
+        else:
+            save_extraction_compare_path = get_output_path(folder, args.save_extraction_compare)
+
+    save_aperture_radii_compare_path = None
+    if args.save_aperture_radii_compare:
+        if os.path.isabs(args.save_aperture_radii_compare):
+            save_aperture_radii_compare_path = args.save_aperture_radii_compare
+        else:
+            save_aperture_radii_compare_path = get_output_path(folder, args.save_aperture_radii_compare)
     
     calibrate_file_path = None
     if args.calibrate_file:
@@ -2991,6 +3535,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"Sternprofil/PSF-Plot wird gespeichert in: {save_stellar_profiles_path}")
         if save_cmd_compare_path:
             print(f"CMD-Methodenvergleich wird gespeichert in: {save_cmd_compare_path}")
+        if save_extraction_compare_path:
+            print(f"Extraktionsmethoden-Vergleich wird gespeichert in: {save_extraction_compare_path}")
+        if save_aperture_radii_compare_path:
+            print(f"Apertur-Radius-Vergleich wird gespeichert in: {save_aperture_radii_compare_path}")
         if calibrate_file_path:
             print(f"Kalibrierungsdatei: {calibrate_file_path}")
 
@@ -3068,7 +3616,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     
     # Annulus-Filterung verarbeiten (überschreibt ggf. cluster_radius)
     annulus_inner = None
-    if args.annulus_radii is not None:
+    if args.annulus is not None:
+        x_center, y_center, r_inner, annulus_width = args.annulus
+        annulus_inner = r_inner
+        cluster_radius = r_inner + annulus_width
+        cluster_center = (x_center, y_center)
+        print(f"Annulus-Filterung: R_inner={annulus_inner:.1f}, R_outer={cluster_radius:.1f} Pixel, "
+              f"Zentrum=({cluster_center[0]:.1f}, {cluster_center[1]:.1f})")
+    elif args.annulus_radii is not None:
         r_inner, r_outer = args.annulus_radii
         if r_inner < 0 or r_outer <= 0:
             print("FEHLER: Annulus-Radien müssen positiv sein.", file=sys.stderr)
@@ -3103,14 +3658,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                                                cluster_center=cluster_center,
                                                cluster_radius=cluster_radius,
                                                aperture_per_star=args.aperture_per_star,
-                                               detect_fwhm_scale=args.detect_fwhm_scale) if datas[0] is not None else (None, None)
+                                               detect_fwhm_scale=args.detect_fwhm_scale, psf_fwhm=args.psf_fwhm) if datas[0] is not None else (None, None)
         result2 = detect_and_photometry_wrapper(datas[1], method=method, fwhm=args.fwhm, 
                                                threshold_sigma=args.threshold, 
                                                aperture_radius=args.aperture,
                                                cluster_center=cluster_center,
                                                cluster_radius=cluster_radius,
                                                aperture_per_star=args.aperture_per_star,
-                                               detect_fwhm_scale=args.detect_fwhm_scale) if datas[1] is not None else (None, None)
+                                               detect_fwhm_scale=args.detect_fwhm_scale, psf_fwhm=args.psf_fwhm) if datas[1] is not None else (None, None)
         
         # Entpacke Ergebnisse
         tab1, aperture_used_1 = result1
@@ -3235,6 +3790,72 @@ def main(argv: Optional[List[str]] = None) -> int:
     
     print()  # Leerzeile
 
+    if args.compare_extraction_methods:
+        # Nur das V-Bild wird benoetigt: bestimme die zugehoerigen Rohdaten/Pfad
+        data_v = datas[0] if filters_swapped else datas[1]
+        path_v = selected[0] if filters_swapped else selected[1]
+
+        if data_v is None:
+            print("Extraktionsmethoden-Vergleich uebersprungen: keine gueltigen Daten fuer das V-Bild.")
+        else:
+            other_method = 'psf' if method == 'aperture' else 'aperture'
+            try:
+                other_result = detect_and_photometry_wrapper(
+                    data_v, method=other_method, fwhm=args.fwhm,
+                    threshold_sigma=args.threshold, aperture_radius=args.aperture,
+                    cluster_center=cluster_center, cluster_radius=cluster_radius,
+                    aperture_per_star=args.aperture_per_star,
+                    detect_fwhm_scale=args.detect_fwhm_scale, psf_fwhm=args.psf_fwhm
+                )
+                tab_other, _ = other_result
+            except Exception as e:
+                print(f"  WARNUNG: {other_method}-Photometrie fuer Extraktionsmethoden-Vergleich fehlgeschlagen: {e}")
+                tab_other = None
+
+            if tab_other is None:
+                print("Extraktionsmethoden-Vergleich uebersprungen: zweite Photometrie-Methode lieferte keine Daten.")
+            else:
+                tab_aperture = tabV if method == 'aperture' else tab_other
+                tab_psf = tab_other if method == 'aperture' else tabV
+
+                aperture_radius_for_plot = aperture_for_plot if aperture_for_plot else 3.0 * args.fwhm
+                plot_extraction_method_comparison_combined(
+                    data_v, path_v, tab_aperture, tab_psf,
+                    max_sep=args.maxsep,
+                    cluster_center=cluster_center, cluster_radius=cluster_radius,
+                    annulus_inner=annulus_inner,
+                    aperture_radius=aperture_radius_for_plot, fwhm=args.fwhm,
+                    save=save_extraction_compare_path
+                )
+
+                if args.compare_aperture_radii:
+                    radii = args.compare_aperture_radii
+                    delta_lists = []
+                    for r in radii:
+                        try:
+                            tab_r, _ = detect_and_photometry_wrapper(
+                                data_v, method='aperture', fwhm=args.fwhm,
+                                threshold_sigma=args.threshold, aperture_radius=r,
+                                cluster_center=cluster_center, cluster_radius=cluster_radius,
+                                aperture_per_star=False, detect_fwhm_scale=args.detect_fwhm_scale, psf_fwhm=args.psf_fwhm
+                            )
+                        except Exception as e:
+                            print(f"  WARNUNG: Apertur-Photometrie mit Radius {r:.1f}px fehlgeschlagen: {e}")
+                            delta_lists.append([])
+                            continue
+                        if tab_r is None:
+                            print(f"  WARNUNG: Keine Quellen fuer Apertur-Radius {r:.1f}px gefunden.")
+                            delta_lists.append([])
+                            continue
+                        entries_r = _match_aperture_psf_entries(
+                            tab_r, tab_psf, max_sep=args.maxsep,
+                            cluster_center=cluster_center, cluster_radius=cluster_radius,
+                            annulus_inner=annulus_inner
+                        )
+                        delta_lists.append([e[4] for e in entries_r])
+
+                    plot_aperture_radius_comparison(radii, delta_lists, save=save_aperture_radii_compare_path)
+
     if len(matched) > 0:
         # Zeige Anzahl der Gesamtquellen für Kontext
         n_total_B = len(tab1) if tab1 is not None else 0
@@ -3259,14 +3880,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                         threshold_sigma=args.threshold, aperture_radius=args.aperture,
                         cluster_center=cluster_center, cluster_radius=cluster_radius,
                         aperture_per_star=args.aperture_per_star,
-                        detect_fwhm_scale=args.detect_fwhm_scale
+                        detect_fwhm_scale=args.detect_fwhm_scale, psf_fwhm=args.psf_fwhm
                     ) if datas[0] is not None else (None, None)
                     compare_result2 = detect_and_photometry_wrapper(
                         datas[1], method=compare_method, fwhm=args.fwhm,
                         threshold_sigma=args.threshold, aperture_radius=args.aperture,
                         cluster_center=cluster_center, cluster_radius=cluster_radius,
                         aperture_per_star=args.aperture_per_star,
-                        detect_fwhm_scale=args.detect_fwhm_scale
+                        detect_fwhm_scale=args.detect_fwhm_scale, psf_fwhm=args.psf_fwhm
                     ) if datas[1] is not None else (None, None)
                 except Exception as e:
                     print(f"  WARNUNG: {compare_method}-Photometrie fehlgeschlagen: {e}")
@@ -3439,14 +4060,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                                     threshold_sigma=args.threshold, aperture_radius=args.aperture,
                                     cluster_center=cluster_center, cluster_radius=cluster_radius,
                                     aperture_per_star=args.aperture_per_star,
-                                    detect_fwhm_scale=args.detect_fwhm_scale
+                                    detect_fwhm_scale=args.detect_fwhm_scale, psf_fwhm=args.psf_fwhm
                                 ) if datas[0] is not None else (None, None)
                                 compare_result2 = detect_and_photometry_wrapper(
                                     datas[1], method=compare_method, fwhm=args.fwhm,
                                     threshold_sigma=args.threshold, aperture_radius=args.aperture,
                                     cluster_center=cluster_center, cluster_radius=cluster_radius,
                                     aperture_per_star=args.aperture_per_star,
-                                    detect_fwhm_scale=args.detect_fwhm_scale
+                                    detect_fwhm_scale=args.detect_fwhm_scale, psf_fwhm=args.psf_fwhm
                                 ) if datas[1] is not None else (None, None)
                             except Exception as e:
                                 print(f"  WARNUNG: {compare_method}-Photometrie fehlgeschlagen: {e}")

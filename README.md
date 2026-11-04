@@ -77,6 +77,9 @@ python photo.py /pfad/zum/fits-ordner --compare-cmd-methods --save-cmd-compare c
   - Wenn `--aperture` gesetzt ist, dient dieser Wert als Basis und wird pro Stern skaliert.
 - `--fwhm FLOAT`
   - FWHM fuer Quellenfindung.
+- `--psf-fwhm FLOAT`
+  - FWHM des PSF-Modells (nur `--photometry-method psf`). Standard: pro Bild automatisch aus hellen, isolierten Sternen geschaetzt.
+  - PSF-Fits ohne Konvergenz, mit Fluss <= 0 oder mit Positionsdrift > FWHM werden verworfen; Zuordnung B/V und Apertur/PSF erfolgt per gegenseitig naechstem Nachbarn.
 - `--detect-fwhm-scale FLOAT`
   - Skaliert die FWHM nur fuer die Peak-Erkennung.
   - Kleinere Werte trennen nahe Sterne besser (z. B. 0.75), koennen aber mehr Fehlpeaks erzeugen.
@@ -92,6 +95,9 @@ python photo.py /pfad/zum/fits-ordner --compare-cmd-methods --save-cmd-compare c
   - Sigma-Schwelle fuer Ausreisser in B-V (Standard: 3.0).
 - `--cluster-radius`, `--cluster-center`, `--annulus-radii`
   - Raeumliche Selektion von Sternen.
+  - Alternativ waehlt `--annulus X Y R_IN BREITE` Sterne in einem Ring mit Zentrum `(X, Y)`, Innenradius `R_IN` und Breite `BREITE` (Pixel).
+  - Beispiel: `python photo.py /pfad/zum/fits-ordner --annulus 512 512 100 50`
+  - `--annulus` ist nicht mit `--cluster-radius`, `--cluster-center` oder `--annulus-radii` kombinierbar.
 - `--calibrate`, `--calibrate-file`
   - Referenzstern-Kalibrierung laden/speichern.
 - `--fit-isochrone`, `--ebv`, `--age-range`, `--age`

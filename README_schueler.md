@@ -107,6 +107,11 @@ Gut daran:
 - besser in dichten Sternfeldern
 - oft genauere Trennung naher Sterne
 
+Automatisch dabei:
+- Die Sterngroesse (FWHM) wird pro Bild aus hellen, einzelnen Sternen gemessen (manuell: --psf-fwhm).
+- Sterne, bei denen der Fit nicht klappt (nicht konvergiert, Fluss <= 0, Position verrutscht), werden entfernt.
+- Sterne in beiden Bildern werden nur zugeordnet, wenn sie sich gegenseitig der naechste Nachbar sind.
+
 Schwachstelle:
 - braucht mehr Rechenzeit
 - haengt davon ab, wie gut das Modell passt
