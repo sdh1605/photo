@@ -78,6 +78,8 @@ try:
     from photutils.detection import DAOStarFinder
     from photutils.aperture import CircularAperture, CircularAnnulus, aperture_photometry
     from astropy.stats import sigma_clipped_stats
+    from photutils.background import LocalBackground, MedianBackground
+    from scipy.ndimage import median_filter
     # PSF-Photometrie Imports (optional)
     try:
         from photutils.psf import IterativePSFPhotometry
@@ -1116,9 +1118,15 @@ def detect_and_psf_photometry(data: np.ndarray, fwhm: float = 3.0, threshold_sig
     else:
         print(f"  Manuelle Apertur: radius = {aperture_radius:.1f} Pixel")
     
-    # Robust stats für Quellenfindung
+    # Globaler Median als Grundniveau; das lokale Rauschen kommt aus dem Hochpass-Bild (robust gegen Sterne)
     mean, median, std = sigma_clipped_stats(data, sigma=3.0)
-    threshold = median + threshold_sigma * std
+    highpass_size = max(5, int(round(5.0 * psf_fwhm_used)) | 1)
+    highpass = data - median_filter(np.asarray(data, dtype=float), size=highpass_size, mode='nearest')
+    noise = 1.4826 * float(np.median(np.abs(highpass - np.median(highpass))))
+    if not np.isfinite(noise) or noise <= 0:
+        noise = std
+    threshold = threshold_sigma * noise
+    print(f"  Detektionsrauschen (Hochpass, MAD): {noise:.2f} ADU (global sigma-clip: {std:.2f} ADU)")
     
     finder_fwhm = max(1.2, float(fwhm) * float(detect_fwhm_scale))
     daofind = DAOStarFinder(fwhm=finder_fwhm, threshold=threshold)
@@ -1134,11 +1142,16 @@ def detect_and_psf_photometry(data: np.ndarray, fwhm: float = 3.0, threshold_sig
         # Erstelle ein einfaches Gauss-PSF-Modell mit bekanntem FWHM
         psf_model = GaussianPSF(x_fwhm=psf_fwhm_used, y_fwhm=psf_fwhm_used)
         
-        # Definiere die Größe der Anpassungsregion um jeden Stern (ungerade Kantenlaenge)
-        fit_size = int(2*aperture_radius+1)
+        # Kompakte Anpassungsregion (~1.5 FWHM Radius, ungerade Kantenlaenge): weniger Nachbarstern-Beitrag
+        fit_size = max(5, int(round(3.0 * psf_fwhm_used)))
         if fit_size % 2 == 0:
             fit_size += 1
         fit_shape = (fit_size, fit_size)
+        
+        # Lokaler Himmelshintergrund pro Stern aus einem Ring ausserhalb des Sternprofils
+        bkg_inner = max(fit_size / 2.0 + 1.0, 2.5 * psf_fwhm_used)
+        bkg_outer = bkg_inner + max(4.0, 2.0 * psf_fwhm_used)
+        local_bkg = LocalBackground(bkg_inner, bkg_outer, bkg_estimator=MedianBackground())
         
         # Erstelle das PSF-Photometrie-Objekt
         photometry = IterativePSFPhotometry(
@@ -1146,6 +1159,7 @@ def detect_and_psf_photometry(data: np.ndarray, fwhm: float = 3.0, threshold_sig
             fit_shape=fit_shape,
             finder=daofind,
             aperture_radius=aperture_radius,
+            local_bkg_estimator=local_bkg,
             maxiters=3  # 3 Iterationen für iterative Subtraktion
         )
         
@@ -1213,7 +1227,10 @@ def detect_and_psf_photometry(data: np.ndarray, fwhm: float = 3.0, threshold_sig
                                             aperture_radius=aperture_radius)
         
         # Füge Himmelshintergrund hinzu (für Konsistenz)
-        phot_table['sky_median'] = np.full(len(phot_table), median)
+        if 'local_bkg' in phot_table.colnames:
+            phot_table['sky_median'] = np.asarray(phot_table['local_bkg'], dtype=float) + median
+        else:
+            phot_table['sky_median'] = np.full(len(phot_table), median)
         
         print(f"  PSF-Photometrie erfolgreich: {len(phot_table)} Sterne angepasst")
         return phot_table, aperture_radius
