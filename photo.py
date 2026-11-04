@@ -44,6 +44,8 @@ Optionen:
                           Mit --calibrate: Speichern. Ohne --calibrate: Laden. Standard: calib.txt im FITS-Ordner.
   --fit-isochrone    Bestimme Entfernung und Alter durch Isochronen-Anpassung (benötigt --calibrate)
   --ebv FLOAT        Rötung E(B-V) in mag für Isochronen-Anpassung (wird interaktiv abgefragt falls nicht angegeben)
+  --old-cluster      Isochronen-Anpassung für alte Haufen (Abknickpunkt + Riesenast, ohne Distanz-Prior)
+  --isochrone-file F PARSEC-Tabelle für --old-cluster (Standard: isochrones_Z0006.txt)
   --age-range MIN MAX    Altersbereich als log(Alter/Jahre) (Standard: 6.5 8.5 = 3-300 Millionen Jahre)
   --age FLOAT        Fixiertes Alter in Millionen Jahren (z.B. 10.6). Wenn gesetzt, wird nur die Entfernung bestimmt.
 
@@ -2682,6 +2684,140 @@ def fit_isochrone_distance_age(obs_bv, obs_v, ebv, age_range=(6.5, 8.5), age_ste
     }
 
 
+def load_old_isochrones(filepath, max_label=3):
+    """Lese Multi-Age-PARSEC-Tabelle und gib {logAge: (B-V, M_V)} für Hauptreihe, Unterriesen- und Riesenast zurück."""
+    with open(filepath, 'r') as f:
+        lines = f.readlines()
+    header = None
+    data_start = 0
+    for i, line in enumerate(lines):
+        if line.lstrip('#').split()[:1] == ['Zini']:
+            header = line.lstrip('#').split()
+            data_start = i + 1
+            break
+    if header is None:
+        raise ValueError(f"Kein Spaltenheader in {filepath}")
+    c_age, c_b, c_v = header.index('logAge'), header.index('Bmag'), header.index('Vmag')
+    c_label = header.index('label')
+    isos = {}
+    for line in lines[data_start:]:
+        if line.startswith('#') or not line.strip():
+            continue
+        p = line.split()
+        try:
+            label = int(p[c_label])
+            if label > max_label:
+                continue
+            age = round(float(p[c_age]), 4)
+            isos.setdefault(age, []).append((float(p[c_b]) - float(p[c_v]), float(p[c_v])))
+        except (ValueError, IndexError):
+            continue
+    return {a: (np.array([x[0] for x in pts]), np.array([x[1] for x in pts])) for a, pts in isos.items()}
+
+
+def fit_isochrone_old_cluster(obs_bv, obs_v, ebv, isochrone_file, fixed_age_myr=None,
+                              output_folder=None, sigma_color=0.08, sigma_v=0.2):
+    """Isochronen-Anpassung für alte Kugelsternhaufen (Abknickpunkt, Unterriesen- und Riesenast).
+
+    Es gibt keinen Entfernungs-Prior. Die Sterne werden mit der gesamten Isochrone
+    (Hauptreihe bis Riesenast, ohne Horizontalast) in der Farb-Helligkeits-Ebene verglichen.
+    Ein Stern zählt mit exp(-d²/2), d = Abstand zur Isochrone in Einheiten der Streuung,
+    dadurch haben Horizontalast, Blue Stragglers und Feldsterne kaum Einfluss.
+    """
+    from scipy.spatial import cKDTree
+
+    print("\n=== Isochrone-Anpassung (alter Haufen, Abknickpunkt/Riesenast) ===")
+    print(f"Rötung E(B-V) = {ebv:.3f} mag, Isochronen: {isochrone_file}")
+    isos = load_old_isochrones(isochrone_file)
+    if not isos:
+        print("FEHLER: Keine Isochronen gefunden.")
+        return None
+    ages = sorted(isos)
+    if fixed_age_myr is not None:
+        target = np.log10(fixed_age_myr * 1e6)
+        ages = [min(ages, key=lambda a: abs(a - target))]
+    print(f"Alter in Tabelle: {', '.join(f'{10**a/1e9:.1f} Gyr' for a in ages)}")
+
+    av = 3.1 * ebv
+    obs_c = np.asarray(obs_bv) - ebv
+    obs_m = np.asarray(obs_v) - av
+    obs_pts = np.column_stack([obs_c / sigma_color, obs_m / sigma_v])
+    # Gewicht 1/Dichte: sonst dominiert der dichte, senkrechte Hauptreihen-Haufen die Anpassung
+    # und der Abknickpunkt sowie der Riesenast bestimmen die Entfernung nicht
+    neighbors = cKDTree(obs_pts).query_ball_point(obs_pts, r=3.0, return_length=True)
+    weights = 1.0 / np.asarray(neighbors, dtype=float)
+
+    dms = np.arange(8.0, 18.0, 0.02)
+    best = None
+    scores_by_age = {}
+    for age in ages:
+        c, m = isos[age]
+        # Verdichte die Isochrone, damit der Abstand zur Kurve statt zu Stützpunkten gemessen wird
+        pts = np.column_stack([c / sigma_color, m / sigma_v])
+        seg = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+        dense = [pts[:1]]
+        for k in range(len(seg)):
+            n = max(1, int(np.ceil(seg[k] / 0.2)))
+            t = np.linspace(0, 1, n + 1)[1:, None]
+            dense.append(pts[k] + t * (pts[k + 1] - pts[k]))
+        dense = np.vstack(dense)
+        scores = np.zeros(len(dms))
+        for j, dm in enumerate(dms):
+            shifted = dense.copy()
+            shifted[:, 1] += dm / sigma_v
+            d, _ = cKDTree(shifted).query(obs_pts)
+            scores[j] = np.sum(weights * np.exp(-0.5 * d**2))
+        scores_by_age[age] = scores
+        j = int(np.argmax(scores))
+        print(f"  Alter {10**age/1e9:5.1f} Gyr: bestes DM = {dms[j]:.2f}, Score = {scores[j]:.1f}")
+        if best is None or scores[j] > best[0]:
+            best = (scores[j], age, dms[j])
+
+    score, best_age, best_dm = best
+    distance_pc = 10**((best_dm + 5) / 5)
+    print(f"\nErgebnis: log(Alter) = {best_age:.2f} ({10**best_age/1e9:.1f} Gyr), "
+          f"DM = {best_dm:.2f} mag, d = {distance_pc:.0f} pc = {distance_pc/1000:.2f} kpc")
+    print(f"  Gewichteter Score: {score:.1f} (maximal {np.sum(weights):.1f})")
+
+    iso_bv, iso_v = isos[best_age]
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 6))
+    for age, s in scores_by_age.items():
+        ax1.plot(dms, s, label=f'{10**age/1e9:.1f} Gyr')
+    ax1.axvline(best_dm, color='k', ls='--')
+    ax1.set_xlabel('Entfernungsmodul [mag]')
+    ax1.set_ylabel('Score')
+    ax1.set_title('Anpassungsgüte')
+    ax1.legend()
+    ax2.scatter(obs_c, obs_m, s=10, c='tab:blue', alpha=0.6, label='Sterne')
+    ax2.plot(iso_bv, iso_v + best_dm, 'r-', lw=2,
+             label=f'Isochrone ({10**best_age/1e9:.1f} Gyr, DM={best_dm:.2f})')
+    ax2.set_xlim(-0.3, 1.6)
+    ax2.set_ylim(np.max(obs_m) + 0.3, np.min(obs_m) - 0.3)
+    ax2.set_xlabel('(B-V)₀ [mag]')
+    ax2.set_ylabel('V₀ [mag]')
+    ax2.set_title(f'd = {distance_pc:.0f} pc, Alter = {10**best_age/1e9:.1f} Gyr')
+    ax2.legend()
+    ax2.grid(alpha=0.3)
+    plt.tight_layout()
+    if output_folder:
+        path = get_output_path(output_folder, 'isochrone_fit.png')
+        fig.savefig(path, dpi=150)
+        print(f"Anpassungs-Plot gespeichert: {path}")
+    plt.show()
+
+    return {
+        'age_log': best_age,
+        'dm': best_dm,
+        'distance_pc': distance_pc,
+        'chi2': float(np.sum(weights) - score) / max(float(np.sum(weights)), 1e-9),
+        'iso_bv': iso_bv,
+        'iso_v': iso_v,
+        'ebv': ebv,
+        'obs_bv_dereddened': obs_c,
+        'obs_v_dereddened': obs_m,
+    }
+
+
 def plot_color_magnitude(matched, tabB, tabV, paths, n_total_B: int = None, n_total_V: int = None, 
                          calibrated: bool = False, mags_B=None, mags_V=None, colors=None,
                          save: Optional[str] = None, 
@@ -3463,6 +3599,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help='Altersbereich für Isochronen-Anpassung als log(age/Jahre) (Standard: 6.8 7.6 = 6-40 Myr)')
     parser.add_argument('--age', type=float, default=None,
                         help='Fixiertes Alter in Millionen Jahren (z.B. 10.6 für NGC869, 25 für M36). Wenn gesetzt, wird nur die Entfernung bestimmt.')
+    parser.add_argument('--old-cluster', action='store_true',
+                        help='Isochronen-Anpassung für alte Haufen (Kugelsternhaufen): fittet Abknickpunkt, Unterriesen- und Riesenast ohne Entfernungs-Prior, Alter 10-14 Gyr.')
+    parser.add_argument('--isochrone-file', type=str, default=None,
+                        help='PARSEC-Tabelle (CMD 3.8) für --old-cluster (Standard: isochrones_Z0006.txt neben photo.py, [Fe/H]≈-1.4)')
     parser.add_argument('--outlier-sigma', type=float, default=3.0,
                         help='Sigma-Schwelle für Ausreißer-Filterung in B-V Farbe (Standard: 3.0). Höhere Werte = weniger Filterung.')
     args = parser.parse_args(argv)
@@ -3999,12 +4139,20 @@ def main(argv: Optional[List[str]] = None) -> int:
                                 ebv = None
                         
                         if ebv is not None:
-                            result = fit_isochrone_distance_age(
-                                calibrated_colors, calibrated_mags_V, ebv,
-                                age_range=tuple(args.age_range),
-                                output_folder=folder,
-                                fixed_age_myr=args.age
-                            )
+                            if args.old_cluster:
+                                iso_file = args.isochrone_file or os.path.join(
+                                    os.path.dirname(os.path.abspath(__file__)), 'isochrones_Z0006.txt')
+                                result = fit_isochrone_old_cluster(
+                                    calibrated_colors, calibrated_mags_V, ebv, iso_file,
+                                    fixed_age_myr=args.age, output_folder=folder
+                                )
+                            else:
+                                result = fit_isochrone_distance_age(
+                                    calibrated_colors, calibrated_mags_V, ebv,
+                                    age_range=tuple(args.age_range),
+                                    output_folder=folder,
+                                    fixed_age_myr=args.age
+                                )
                             
                             if result is not None:
                                 # Entpacke Ergebnisse

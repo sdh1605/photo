@@ -149,6 +149,11 @@ Vorteile:
 Nachteile:
 - Rechenaufwendiger.
 - Abhaengig von der Guete des PSF-Modells.
+
+Details der PSF-Auswertung:
+- Lokaler Himmelshintergrund pro Stern aus einem Ring um den Stern (wichtig in dichten Haufen).
+- Kompakte Fitregion (ca. 1.5 FWHM Radius), damit Nachbarsterne weniger einfliessen.
+- Detektionsrauschen wird robust (MAD) aus einem Hochpass-Bild bestimmt, nicht aus der Streuung des ganzen Bildes; so werden auch schwaechere Sterne im Haufen gefunden.
 - Bei Problemen wird im Skript auf Apertur-Photometrie zurueckgefallen.
 
 ## Trennung naher Sterne
@@ -207,3 +212,4 @@ Standardmaessig werden relative Ausgabepfade im FITS-Ordner gespeichert.
 
   Hinweis zu Defaults:
   - `--age-range` Standard ist `6.8 7.6` (log(Alter/Jahre), ca. 6-40 Myr).
+  - Für alte Haufen/Kugelsternhaufen (z.B. M12) `--old-cluster` verwenden: Anpassung von Abknickpunkt, Unterriesen- und Riesenast ohne Entfernungs-Prior (Entfernungsmodul 8-18 mag) mit metallarmen Isochronen (`isochrones_Z0006.txt`, Z=0.0006, 10-14 Gyr). Eigene Tabelle per `--isochrone-file`. Beispiel: `python3 photo.py m12 --filters B V --photometry-method psf --calibrate-file calib_m12.txt --fit-isochrone --old-cluster --ebv 0.19` (M12: d ≈ 5.4 kpc).
